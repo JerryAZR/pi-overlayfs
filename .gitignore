@@ -1,0 +1,7 @@
+node_modules/
+dist/
+
+# Session-analysis extracts (regenerable via scripts/classify-session-bash.mjs;
+# contain raw command history, so keep them out of version control)
+bash-calls.json
+bash-calls-classified.json
