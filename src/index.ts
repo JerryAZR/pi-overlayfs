@@ -91,11 +91,10 @@ export default function (pi: ExtensionAPI) {
 			runExclusive: (fn) => mutex.run(fn),
 			getStagedPaths: () => [...sandbox.diff().deletions, ...sandbox.diff().writes.map((w) => w.path)],
 			dropStagedPathsExcept: (keepPaths) => {
-				// NOTE (path granularity): the keep-set is path-based. If the
-				// aborted run overwrote a path that was ALREADY pending before the
-				// run (only reachable after a prior finisher failure), that path
-				// keeps the aborted run's content and a later finisher retry may
-				// apply it over the native rerun's result — accepted narrow case.
+				// NOTE (path granularity): the keep-set is path-based. Defense in
+				// depth only: pre-existing pending state used to be reachable via
+				// a finisher failure, but the apply-or-drop policy now drops all
+				// residue on failure, so the keep-set is normally the empty set.
 				const keep = new Set(keepPaths);
 				const pending = sandbox.diff();
 				const stale = [
@@ -203,8 +202,8 @@ export default function (pi: ExtensionAPI) {
 					outsidePolicy: () => process.env.PI_OVERLAYFS_OUTSIDE_PROJECT,
 				});
 			} catch (error) {
-				// A finisher failure must never break the session; unapplied
-				// entries stay pending and retry on the next turn_end.
+				// Defensive: runFinisher handles apply/confirm failures internally
+				// (apply-or-drop, see finisher.ts); this is for unexpected errors.
 				const message = error instanceof Error ? error.message : String(error);
 				console.error(`pi-overlayfs: finisher failed: ${message}`);
 				try {
@@ -215,20 +214,41 @@ export default function (pi: ExtensionAPI) {
 				return undefined;
 			}
 		});
-		// Rejection honesty: tool results stay untouched (success in the
-		// overlay IS success), and the model hears about discarded changes via
-		// a steering message before its next LLM call.
-		if (report && report.droppedDenied.length > 0) {
+		if (!report) return;
+		if (report.failure) {
+			try {
+				ctx.ui.notify(`pi-overlayfs: failed to apply staged changes: ${report.failure}`, "error");
+			} catch {
+				/* no UI */
+			}
+		}
+		// Rejection/failure honesty: tool results stay untouched (success in
+		// the overlay IS success), and the model hears about discarded changes
+		// via a steering message before its next LLM call.
+		const sections: string[] = [];
+		if (report.droppedDenied.length > 0) {
 			const paths = report.droppedDenied;
+			sections.push(
+				`${paths.length} change${paths.length === 1 ? "" : "s"} outside the project root ` +
+					`were rejected and discarded without touching disk:\n${paths.map((p) => `- ${p}`).join("\n")}`,
+			);
+		}
+		if (report.droppedFailed.length > 0) {
+			const paths = report.droppedFailed;
+			sections.push(
+				`${paths.length} staged change${paths.length === 1 ? "" : "s"} could not be written to disk ` +
+					`and were discarded:\n${paths.map((p) => `- ${p}`).join("\n")}`,
+			);
+		}
+		if (sections.length > 0) {
 			try {
 				pi.sendMessage(
 					{
 						customType: "pi-overlayfs",
 						display: true,
 						content:
-							`${paths.length} change${paths.length === 1 ? "" : "s"} outside the project root ` +
-							`were rejected and discarded without touching disk:\n${paths.map((p) => `- ${p}`).join("\n")}\n` +
-							`They existed only in a temporary filesystem; subsequent reads will not find them.`,
+							sections.join("\n") +
+							"\nThey existed only in a temporary filesystem; subsequent reads will not find them.",
 					},
 					{ deliverAs: "steer" },
 				);

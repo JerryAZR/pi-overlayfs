@@ -1,9 +1,11 @@
 /**
- * Post-tool finisher: after each mutating tool call, apply staged overlay
- * changes to disk. Changes inside the project root are auto-approved; changes
- * outside it require confirmation (ctx.ui.confirm) or, headless, the
+ * Post-turn finisher: at turn_end, apply staged overlay changes to disk.
+ * Changes inside the project root are auto-approved; changes outside it
+ * require confirmation (ctx.ui.confirm) or, headless, the
  * PI_OVERLAYFS_OUTSIDE_PROJECT=approve env var. Denied changes are dropped
- * from the overlay (never applied).
+ * from the overlay (never applied). Apply-or-drop: a failure during
+ * confirm/apply discards the unapplied remainder and reports it — no staged
+ * change survives across turns.
  *
  * Dependencies are injected so the partition/apply/drop logic is testable
  * against a real sandbox on temp dirs without a pi runtime.
@@ -42,6 +44,15 @@ export interface FinisherReport {
 	 * changes worth mentioning.
 	 */
 	droppedDenied: string[];
+	/**
+	 * Paths that could NOT be applied (apply or confirm error) and were
+	 * dropped instead — the apply-or-drop policy: no staged change survives
+	 * across turns, so a failure discards the remainder and reports it for
+	 * the steering warning. No-op directory scaffolding is excluded.
+	 */
+	droppedFailed: string[];
+	/** Error message when a failure forced drops (undefined on success). */
+	failure?: string;
 }
 
 function isNoOpDirectoryWrite(write: SandboxWrite, isExistingDirectory: (p: string) => boolean): boolean {
@@ -89,7 +100,13 @@ function realPathsOf(changes: SandboxChangeSet): string[] {
 }
 
 export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
-	const report: FinisherReport = { appliedInside: 0, appliedOutside: 0, droppedOutside: 0, droppedDenied: [] };
+	const report: FinisherReport = {
+		appliedInside: 0,
+		appliedOutside: 0,
+		droppedOutside: 0,
+		droppedDenied: [],
+		droppedFailed: [],
+	};
 	const changes = deps.diff();
 	if (changes.writes.length === 0 && changes.deletions.length === 0) return report;
 
@@ -102,30 +119,51 @@ export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 	if (noOpDirs.length > 0) {
 		deps.drop(noOpDirs);
 	}
-
-	if (inside.writes.length > 0 || inside.deletions.length > 0) {
-		await deps.applyChanges(inside);
-		report.appliedInside += inside.writes.length + inside.deletions.length;
-	}
-
 	const submittedForDrop = [...noOpDirs];
-	if (outside.writes.length === 0 && outside.deletions.length === 0) {
-		report.droppedOutside = countActuallyDropped(deps, submittedForDrop);
-		return report;
-	}
 
-	const outsidePaths = realPathsOf(outside);
-	const approved = deps.confirm
-		? await deps.confirm(outsidePaths)
-		: deps.outsidePolicy()?.toLowerCase() === "approve";
+	try {
+		if (inside.writes.length > 0 || inside.deletions.length > 0) {
+			await deps.applyChanges(inside);
+			report.appliedInside += inside.writes.length + inside.deletions.length;
+		}
 
-	if (approved) {
-		await deps.applyChanges(outside);
-		report.appliedOutside += outsidePaths.length;
-	} else {
-		deps.drop(outsidePaths);
-		submittedForDrop.push(...outsidePaths);
-		report.droppedDenied = outsidePaths;
+		if (outside.writes.length > 0 || outside.deletions.length > 0) {
+			const outsidePaths = realPathsOf(outside);
+			const approved = deps.confirm
+				? await deps.confirm(outsidePaths)
+				: deps.outsidePolicy()?.toLowerCase() === "approve";
+
+			if (approved) {
+				await deps.applyChanges(outside);
+				report.appliedOutside += outsidePaths.length;
+			} else {
+				deps.drop(outsidePaths);
+				submittedForDrop.push(...outsidePaths);
+				report.droppedDenied = outsidePaths;
+			}
+		}
+	} catch (error) {
+		// Apply-or-drop: a failure never leaves pending residue across turns.
+		// (applyChanges drops the entries it already applied, so the remaining
+		// diff is exactly the unapplied remainder.) Drop it and report it —
+		// the model must learn its changes did not persist.
+		report.failure = error instanceof Error ? error.message : String(error);
+		const remaining = deps.diff();
+		const remainingPaths = realPathsOf(remaining);
+		if (remainingPaths.length > 0) {
+			try {
+				deps.drop(remainingPaths);
+				submittedForDrop.push(...remainingPaths);
+			} catch {
+				/* drop is best-effort */
+			}
+			report.droppedFailed = [
+				...remaining.deletions,
+				...remaining.writes
+					.filter((w) => !isNoOpDirectoryWrite(w, deps.isExistingDirectory))
+					.map((w) => w.path),
+			];
+		}
 	}
 	report.droppedOutside = countActuallyDropped(deps, submittedForDrop);
 	return report;

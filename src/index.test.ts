@@ -184,6 +184,31 @@ describe("extension wiring (fake pi, real sandbox)", () => {
 		expect(readFileSync(target, "utf8")).toBe("x\n");
 	});
 
+	it("finisher failure (confirm throws) → drops, notifies, and steers with the failed paths", async () => {
+		const notifications: string[] = [];
+		const fake = makeFakePi();
+		const ctx = fakeCtx(project, {
+			hasUI: true,
+			notifications,
+			confirm: async () => {
+				throw new Error("ui exploded");
+			},
+		});
+		await startSession(fake, project, ctx);
+		const write = toolByName(fake, "write");
+		const outside = path.join(home, "failed.txt");
+
+		await write.execute("call-1", { path: outside, content: "x\n" }, undefined, undefined);
+		await turnEnd(fake, ctx);
+
+		expect(existsSync(outside)).toBe(false);
+		expect(notifications.some((n) => n.includes("ui exploded"))).toBe(true);
+		expect(fake.messages).toHaveLength(1);
+		const content = String(fake.messages[0]!.msg.content);
+		expect(content).toContain("failed.txt");
+		expect(content).toMatch(/could not be written/i);
+	});
+
 	it("sends a steering warning when outside-project changes are denied (UI deny)", async () => {
 		const fake = makeFakePi();
 		const ctx = fakeCtx(project, { hasUI: true, confirm: async () => false });

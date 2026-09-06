@@ -300,7 +300,7 @@ describe("runtime fallback safety (real sandbox)", () => {
 			isExistingDirectory: () => true,
 			outsidePolicy: () => "approve",
 		});
-		expect(report).toEqual({ appliedInside: 0, appliedOutside: 0, droppedOutside: 0, droppedDenied: [] });
+		expect(report).toEqual({ appliedInside: 0, appliedOutside: 0, droppedOutside: 0, droppedDenied: [], droppedFailed: [] });
 		expect(await import("node:fs/promises").then((fs) => fs.readFile(tsPath, "utf8"))).toBe("native\n");
 	});
 
@@ -316,7 +316,7 @@ describe("runtime fallback safety (real sandbox)", () => {
 		expect(emitted).toBe("prefixout\nnative\n");
 	});
 
-	it("pre-existing staged state (e.g. a failed apply pending retry) survives the fallback discard", async () => {
+	it("pre-existing staged state (defense-in-depth keep-set) survives the fallback discard", async () => {
 		// Stage something BEFORE the bash run, simulating a prior failed apply.
 		const prior = await sandbox.exec("echo prior > prior.txt");
 		expect(prior.exitCode).toBe(0);

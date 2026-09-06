@@ -158,6 +158,49 @@ describe("runFinisher (real sandbox on temp dirs)", () => {
 		expect(deniedReport.droppedDenied[0]!.replace(/\\/g, "/")).toContain("denied.txt");
 	});
 
+	it("apply-or-drop: an apply failure drops all remaining staged changes and reports them", async () => {
+		await stage("echo a > inside.txt");
+		await stage("echo b > ../outside.txt");
+		const report = await runFinisher(
+			makeDeps({
+				applyChanges: async () => {
+					throw new Error("disk full");
+				},
+				confirm: async () => true, // outside would have been approved — apply fails first
+			}),
+		);
+
+		expect(report.failure).toContain("disk full");
+		expect(existsSync(path.join(project, "inside.txt"))).toBe(false);
+		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
+		// No cross-turn residue: everything pending was dropped.
+		expect(sandbox.diff().writes).toHaveLength(0);
+		expect(sandbox.diff().deletions).toHaveLength(0);
+		// The report names what was lost, for the steering warning.
+		const failed = report.droppedFailed.map((p) => p.replace(/\\/g, "/"));
+		expect(failed.some((p) => p.includes("inside.txt"))).toBe(true);
+		expect(failed.some((p) => p.includes("outside.txt"))).toBe(true);
+		// Nothing was "denied" — this was a failure, not a rejection.
+		expect(report.droppedDenied).toEqual([]);
+	});
+
+	it("apply-or-drop: a confirm error also drops instead of leaving residue", async () => {
+		await stage("echo x > ../outside.txt");
+		const report = await runFinisher(
+			makeDeps({
+				confirm: async () => {
+					throw new Error("ui gone");
+				},
+			}),
+		);
+
+		expect(report.failure).toContain("ui gone");
+		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
+		expect(sandbox.diff().writes).toHaveLength(0);
+		expect(report.droppedFailed.some((p) => p.includes("outside.txt"))).toBe(true);
+		expect(report.droppedDenied).toEqual([]);
+	});
+
 	it("applies deletions inside the project", async () => {
 		await stage("rm seed.txt");
 		await runFinisher(makeDeps());
@@ -168,7 +211,7 @@ describe("runFinisher (real sandbox on temp dirs)", () => {
 	it("is a no-op when nothing is staged", async () => {
 		let confirmCalls = 0;
 		const report = await runFinisher(makeDeps({ confirm: async () => (confirmCalls++, true) }));
-		expect(report).toEqual({ appliedInside: 0, appliedOutside: 0, droppedOutside: 0, droppedDenied: [] });
+		expect(report).toEqual({ appliedInside: 0, appliedOutside: 0, droppedOutside: 0, droppedDenied: [], droppedFailed: [] });
 		expect(confirmCalls).toBe(0);
 	});
 
