@@ -215,9 +215,9 @@ export default function (pi: ExtensionAPI) {
 			}
 		});
 		if (!report) return;
-		if (report.failure) {
+		if (report.failed) {
 			try {
-				ctx.ui.notify(`pi-overlayfs: failed to apply staged changes: ${report.failure}`, "error");
+				ctx.ui.notify(`pi-overlayfs: failed to apply staged changes: ${report.failed.error}`, "error");
 			} catch {
 				/* no UI */
 			}
@@ -226,15 +226,15 @@ export default function (pi: ExtensionAPI) {
 		// the overlay IS success), and the model hears about discarded changes
 		// via a steering message before its next LLM call.
 		const sections: string[] = [];
-		if (report.droppedDenied.length > 0) {
-			const paths = report.droppedDenied;
+		if (report.denied.length > 0) {
+			const paths = report.denied;
 			sections.push(
 				`${paths.length} change${paths.length === 1 ? "" : "s"} outside the project root ` +
 					`were rejected and discarded without touching disk:\n${paths.map((p) => `- ${p}`).join("\n")}`,
 			);
 		}
-		if (report.droppedFailed.length > 0) {
-			const paths = report.droppedFailed;
+		if (report.failed && report.failed.paths.length > 0) {
+			const paths = report.failed.paths;
 			sections.push(
 				`${paths.length} staged change${paths.length === 1 ? "" : "s"} could not be written to disk ` +
 					`and were discarded:\n${paths.map((p) => `- ${p}`).join("\n")}`,

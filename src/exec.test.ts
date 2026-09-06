@@ -300,7 +300,7 @@ describe("runtime fallback safety (real sandbox)", () => {
 			isExistingDirectory: () => true,
 			outsidePolicy: () => "approve",
 		});
-		expect(report).toEqual({ appliedInside: 0, appliedOutside: 0, droppedOutside: 0, droppedDenied: [], droppedFailed: [] });
+		expect(report).toEqual({ applied: 0, denied: [], failed: null });
 		expect(await import("node:fs/promises").then((fs) => fs.readFile(tsPath, "utf8"))).toBe("native\n");
 	});
 

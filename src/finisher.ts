@@ -28,31 +28,15 @@ export interface FinisherDeps {
 }
 
 export interface FinisherReport {
-	appliedInside: number;
-	appliedOutside: number;
+	/** Entries applied to disk (inside-project auto-approved + approved outside). */
+	applied: number;
+	/** Outside-project paths DENIED by the user or the headless policy → dropped. */
+	denied: string[];
 	/**
-	 * Outside-project staged paths actually removed from the pending set
-	 * (verified against a post-run diff). OverlayFs.drop() keeps directory
-	 * nodes whose children are still pending, so this can be lower than the
-	 * number of paths submitted for dropping.
+	 * Approved but FAILED to apply (apply or confirm error) → dropped per the
+	 * apply-or-drop policy. paths excludes no-op directory scaffolding.
 	 */
-	droppedOutside: number;
-	/**
-	 * Outside-project paths DENIED (by the user or the headless policy) and
-	 * submitted for dropping — the payload for the post-turn steering warning.
-	 * No-op directory scaffolding is excluded: those entries were never real
-	 * changes worth mentioning.
-	 */
-	droppedDenied: string[];
-	/**
-	 * Paths that could NOT be applied (apply or confirm error) and were
-	 * dropped instead — the apply-or-drop policy: no staged change survives
-	 * across turns, so a failure discards the remainder and reports it for
-	 * the steering warning. No-op directory scaffolding is excluded.
-	 */
-	droppedFailed: string[];
-	/** Error message when a failure forced drops (undefined on success). */
-	failure?: string;
+	failed: { error: string; paths: string[] } | null;
 }
 
 function isNoOpDirectoryWrite(write: SandboxWrite, isExistingDirectory: (p: string) => boolean): boolean {
@@ -100,13 +84,7 @@ function realPathsOf(changes: SandboxChangeSet): string[] {
 }
 
 export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
-	const report: FinisherReport = {
-		appliedInside: 0,
-		appliedOutside: 0,
-		droppedOutside: 0,
-		droppedDenied: [],
-		droppedFailed: [],
-	};
+	const report: FinisherReport = { applied: 0, denied: [], failed: null };
 	const changes = deps.diff();
 	if (changes.writes.length === 0 && changes.deletions.length === 0) return report;
 
@@ -119,12 +97,11 @@ export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 	if (noOpDirs.length > 0) {
 		deps.drop(noOpDirs);
 	}
-	const submittedForDrop = [...noOpDirs];
 
 	try {
 		if (inside.writes.length > 0 || inside.deletions.length > 0) {
 			await deps.applyChanges(inside);
-			report.appliedInside += inside.writes.length + inside.deletions.length;
+			report.applied += inside.writes.length + inside.deletions.length;
 		}
 
 		if (outside.writes.length > 0 || outside.deletions.length > 0) {
@@ -135,11 +112,10 @@ export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 
 			if (approved) {
 				await deps.applyChanges(outside);
-				report.appliedOutside += outsidePaths.length;
+				report.applied += outsidePaths.length;
 			} else {
 				deps.drop(outsidePaths);
-				submittedForDrop.push(...outsidePaths);
-				report.droppedDenied = outsidePaths;
+				report.denied = outsidePaths;
 			}
 		}
 	} catch (error) {
@@ -147,34 +123,26 @@ export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 		// (applyChanges drops the entries it already applied, so the remaining
 		// diff is exactly the unapplied remainder.) Drop it and report it —
 		// the model must learn its changes did not persist.
-		report.failure = error instanceof Error ? error.message : String(error);
 		const remaining = deps.diff();
 		const remainingPaths = realPathsOf(remaining);
 		if (remainingPaths.length > 0) {
 			try {
 				deps.drop(remainingPaths);
-				submittedForDrop.push(...remainingPaths);
 			} catch {
 				/* drop is best-effort */
 			}
-			report.droppedFailed = [
+		}
+		report.failed = {
+			error: error instanceof Error ? error.message : String(error),
+			paths: [
 				...remaining.deletions,
 				...remaining.writes
 					.filter((w) => !isNoOpDirectoryWrite(w, deps.isExistingDirectory))
 					.map((w) => w.path),
-			];
-		}
+			],
+		};
 	}
-	report.droppedOutside = countActuallyDropped(deps, submittedForDrop);
 	return report;
-}
-
-/** Count submitted paths that are no longer pending (drop is best-effort for dir nodes). */
-function countActuallyDropped(deps: FinisherDeps, submitted: string[]): number {
-	if (submitted.length === 0) return 0;
-	const post = deps.diff();
-	const stillPending = new Set([...post.deletions, ...post.writes.map((w) => w.path)]);
-	return submitted.filter((p) => !stillPending.has(p)).length;
 }
 
 /**

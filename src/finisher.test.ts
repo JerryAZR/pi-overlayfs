@@ -100,7 +100,7 @@ describe("runFinisher (real sandbox on temp dirs)", () => {
 
 		expect(readFileSync(path.join(project, "staged.txt"), "utf8")).toBe("staged\n");
 		expect(confirmCalls).toBe(0);
-		expect(report.appliedInside).toBeGreaterThan(0);
+		expect(report.applied).toBeGreaterThan(0);
 		expect(sandbox.diff().writes).toHaveLength(0);
 	});
 
@@ -129,7 +129,7 @@ describe("runFinisher (real sandbox on temp dirs)", () => {
 
 		expect(confirmedPaths).toEqual([[path.join(home, "outside.txt")]]);
 		expect(readFileSync(path.join(home, "outside.txt"), "utf8")).toBe("secret\n");
-		expect(report.appliedOutside).toBe(1);
+		expect(report.applied).toBe(1);
 	});
 
 	it("drops denied outside-project changes (never written to disk, not re-prompted)", async () => {
@@ -137,25 +137,24 @@ describe("runFinisher (real sandbox on temp dirs)", () => {
 		const report = await runFinisher(makeDeps({ confirm: async () => false }));
 
 		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
-		expect(report.droppedOutside).toBe(1);
 		// Denied entries are gone from the pending set.
 		expect(sandbox.diff().writes).toHaveLength(0);
 		// …and reported for the post-turn steering warning.
-		expect(report.droppedDenied).toHaveLength(1);
-		expect(report.droppedDenied[0]!.replace(/\\/g, "/")).toContain("outside.txt");
+		expect(report.denied).toHaveLength(1);
+		expect(report.denied[0]!.replace(/\\/g, "/")).toContain("outside.txt");
 	});
 
 	it("headless: honors PI_OVERLAYFS_OUTSIDE_PROJECT-style policy", async () => {
 		await stage("echo a > ../approved.txt");
 		const approvedReport = await runFinisher(makeDeps({ outsidePolicy: () => "approve" }));
 		expect(existsSync(path.join(home, "approved.txt"))).toBe(true);
-		expect(approvedReport.droppedDenied).toEqual([]);
+		expect(approvedReport.denied).toEqual([]);
 
 		await stage("echo b > ../denied.txt");
 		const deniedReport = await runFinisher(makeDeps({ outsidePolicy: () => undefined }));
 		expect(existsSync(path.join(home, "denied.txt"))).toBe(false);
-		expect(deniedReport.droppedDenied).toHaveLength(1);
-		expect(deniedReport.droppedDenied[0]!.replace(/\\/g, "/")).toContain("denied.txt");
+		expect(deniedReport.denied).toHaveLength(1);
+		expect(deniedReport.denied[0]!.replace(/\\/g, "/")).toContain("denied.txt");
 	});
 
 	it("apply-or-drop: an apply failure drops all remaining staged changes and reports them", async () => {
@@ -170,18 +169,18 @@ describe("runFinisher (real sandbox on temp dirs)", () => {
 			}),
 		);
 
-		expect(report.failure).toContain("disk full");
+		expect(report.failed?.error).toContain("disk full");
 		expect(existsSync(path.join(project, "inside.txt"))).toBe(false);
 		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
 		// No cross-turn residue: everything pending was dropped.
 		expect(sandbox.diff().writes).toHaveLength(0);
 		expect(sandbox.diff().deletions).toHaveLength(0);
 		// The report names what was lost, for the steering warning.
-		const failed = report.droppedFailed.map((p) => p.replace(/\\/g, "/"));
-		expect(failed.some((p) => p.includes("inside.txt"))).toBe(true);
-		expect(failed.some((p) => p.includes("outside.txt"))).toBe(true);
+		const failedPaths = (report.failed?.paths ?? []).map((p) => p.replace(/\\/g, "/"));
+		expect(failedPaths.some((p) => p.includes("inside.txt"))).toBe(true);
+		expect(failedPaths.some((p) => p.includes("outside.txt"))).toBe(true);
 		// Nothing was "denied" — this was a failure, not a rejection.
-		expect(report.droppedDenied).toEqual([]);
+		expect(report.denied).toEqual([]);
 	});
 
 	it("apply-or-drop: a confirm error also drops instead of leaving residue", async () => {
@@ -194,11 +193,11 @@ describe("runFinisher (real sandbox on temp dirs)", () => {
 			}),
 		);
 
-		expect(report.failure).toContain("ui gone");
+		expect(report.failed?.error).toContain("ui gone");
 		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
 		expect(sandbox.diff().writes).toHaveLength(0);
-		expect(report.droppedFailed.some((p) => p.includes("outside.txt"))).toBe(true);
-		expect(report.droppedDenied).toEqual([]);
+		expect(report.failed?.paths.some((p) => p.includes("outside.txt"))).toBe(true);
+		expect(report.denied).toEqual([]);
 	});
 
 	it("applies deletions inside the project", async () => {
@@ -211,28 +210,7 @@ describe("runFinisher (real sandbox on temp dirs)", () => {
 	it("is a no-op when nothing is staged", async () => {
 		let confirmCalls = 0;
 		const report = await runFinisher(makeDeps({ confirm: async () => (confirmCalls++, true) }));
-		expect(report).toEqual({ appliedInside: 0, appliedOutside: 0, droppedOutside: 0, droppedDenied: [], droppedFailed: [] });
+		expect(report).toEqual({ applied: 0, denied: [], failed: null });
 		expect(confirmCalls).toBe(0);
-	});
-
-	it("L1: droppedOutside counts only entries actually removed from the pending set", async () => {
-		// drop() that removes nothing (OverlayFs.drop keeps dir nodes whose
-		// children are still pending): the report must reflect reality.
-		const outsideFile = path.join(home, "kept.txt");
-		const changes: SandboxChangeSet = {
-			writes: [
-				{ path: outsideFile, nodeType: "file", content: new Uint8Array(), mode: 0o644, mtime: new Date() },
-			],
-			deletions: [],
-		};
-		const report = await runFinisher(
-			makeDeps({
-				diff: () => changes,
-				drop: () => {},
-				confirm: async () => false,
-			}),
-		);
-		expect(report.droppedOutside).toBe(0);
-		expect(report.appliedOutside).toBe(0);
 	});
 });
