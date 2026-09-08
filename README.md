@@ -1,21 +1,21 @@
 # pi-overlayfs
 
-A [pi](https://github.com/earendil-works/pi) extension that routes pi's file-touching tools — **bash, read, write, edit**, plus a new **python** tool — through a virtual overlay filesystem ([@jerryan/just-bash](https://www.npmjs.com/package/@jerryan/just-bash) `createAgentSandbox`).
+A [pi](https://github.com/earendil-works/pi) extension that routes pi's file-touching tools — **bash, read, write, edit**, plus a new **python** tool — through per-call copy-on-write filesystem forks ([@jerryan/just-bash](https://www.npmjs.com/package/@jerryan/just-bash) `createVfsTemplate`).
 
 ## What it does
 
-- The real home directory is mounted copy-on-write at virtual `/home/user`; the project directory is either a subpath of that overlay (when it lives inside home) or its own overlay at virtual `/project`.
-- All tool file access goes through the overlay: writes **stage in a copy-on-write memory layer** and never touch disk directly.
-- Once per turn — at `turn_end`, after **all** tool calls in the batch have completed (pi awaits every execution before emitting it, and awaits the finisher before the next LLM call) — a finisher reviews the staged changes (real host paths) and applies them to disk:
+- The real home directory is mounted copy-on-write at virtual `/home/user`; the project directory is either a subpath of that overlay (when it lives inside home) or its own overlay at virtual `/project`. `/tmp` is shared scratch memory.
+- **Every tool call gets a fresh COW fork.** Writes land in the call's private memory layer and never touch disk directly; calls never see each other's uncommitted writes (fork(2) semantics — `/tmp` is the shared channel). Calls run fully concurrently: isolation comes from the topology, not from locking.
+- Once per turn — at `turn_end`, after **all** tool calls in the batch have completed (pi awaits every execution before emitting it, and awaits the finisher before the next LLM call) — the turn's forks are **merged** into one change set (deterministic: later `changedAt` wins conflicts, ties by completion order) and a finisher applies it to disk:
   - **Inside the project root** — auto-approved, applied immediately.
-  - **Outside the project root** — one `ctx.ui.confirm` dialog per turn listing the affected paths. Approved paths are applied; denied paths are dropped from the overlay (they never existed as far as disk is concerned).
-  - **Headless** (no UI) — outside-project changes are dropped unless `PI_OVERLAYFS_OUTSIDE_PROJECT=approve` is set.
-  - **Denied changes are never silent** — the model gets a steering message before its next LLM call listing exactly which paths were discarded (whether rejected by the user/policy or lost to an apply failure), so it doesn't believe its writes persisted. Tool results themselves are left untouched (a write that succeeded in the overlay is reported honestly as success).
+  - **Outside the project root** — one `ctx.ui.confirm` dialog per turn listing the affected paths. Approved paths are applied; denied paths are discarded (they never existed as far as disk is concerned).
+  - **Headless** (no UI) — outside-project changes are discarded unless `PI_OVERLAYFS_OUTSIDE_PROJECT=approve` is set.
+  - **Discarded changes are never silent** — the model gets a steering message before its next LLM call listing exactly which paths were dropped (whether rejected by the user/policy or lost to an apply failure), so it doesn't believe its writes persisted. Tool results themselves are left untouched (a write that succeeded in its fork is reported honestly as success).
 - Commands that the sandbox cannot resolve (e.g. `git`, `npm`, `node`) fall back to native host execution automatically (static pre-flight analysis first, runtime exit-127 fallback second). Commands the analyzer cannot parse at all (e.g. Windows cmd-style `%VAR%`/`2>nul` syntax) and commands whose cwd maps to no overlay also run natively.
 - **Deletion verbs never ride along with host-only commands.** If one bash call mixes `rm`/`mv`/`rmdir` with natively-routed commands (`rm scratch && cargo build`), the call is rejected and the model is asked to run the deletion as its own separate call — a native route would otherwise let the deletion bypass the overlay and its outside-project gate. Matching is token-exact via the shell parser: `git rm`, `echo rm`, and quoted strings are not flagged. Residual gaps (rare; documented, not handled): verbs hidden from static analysis such as `find -delete`, `xargs rm`, or `bash -c "rm ..."`.
 - `bash` and `python` calls default to a **300-second timeout** when the model omits `timeout` (on both the sandboxed and native routes), so a hung script can't stall the session until manual abort. An explicit `timeout` always wins.
 
-Because execution is structurally sandboxed, a model mistake like `rm -rf ~/important` hits throwaway memory; the finisher asks before anything outside the project reaches disk.
+Because execution is structurally sandboxed, a model mistake like `rm -rf ~/important` hits a throwaway fork; the finisher asks before anything outside the project reaches disk. Aborted or failed calls simply never register their fork, so their partial writes never reach the merge.
 
 ## ⚠️ Native fallback amplifies command scope
 
@@ -23,15 +23,15 @@ When a command references a program the sandbox cannot resolve (`git`, `npm`, `n
 
 Keep that in mind yourself when reviewing what the agent runs: single-purpose sandbox commands (`rm -rf node_modules` alone) are staged and reviewable; the same operation glued to an unresolved program with `&&`/`;` is not.
 
-The sandbox detects unresolved commands twice: statically before execution (the whole command goes native untouched), and at runtime via just-bash's fail-fast abort (exit 127). On the runtime path the already-executed prefix may have staged writes in the overlay; those are **discarded before the native rerun** so the finisher can never apply stale staged content over the native run's newer results, and the aborted attempt's output is never shown twice.
+The sandbox detects unresolved commands twice: statically before execution (the whole command goes native untouched), and at runtime via just-bash's fail-fast abort (exit 127). On the runtime path the already-executed prefix may have staged writes in its fork; that fork is **never registered for the merge**, so no stale staged content can be applied over the native rerun's newer results, and the aborted attempt's output is never shown twice.
 
 ### Future: split execution ("migration mechanism")
 
-Running `rm` inside the sandbox and `npm install` natively *from the same compound command* would require migrating fs state between the two engines mid-line. Accepted as out of scope for now. Before building it, evaluate how often it matters: replay historical bash tool calls from pi session files (`~/.pi/agent/sessions`) through `analyzeCommands` and bucket them into fully-sandboxed / native-by-analysis / native-only-at-runtime (statically unverifiable, e.g. command substitutions). The last bucket is what split execution would rescue.
+Running `rm` inside the sandbox and `npm install` natively *from the same compound command* would require migrating fs state between the two engines mid-line. Accepted as out of scope for now. Historical session analysis (4,809 bash calls) shows the mixed pattern is ~2% of calls and dominated by scratch-file cleanup — the mixed rm/mv rejection above covers the deletion slice; the rest stays native by design.
 
 ## The python tool
 
-Runs sandboxed CPython (Emscripten) over the **same overlay filesystem as bash**:
+Runs sandboxed CPython (Emscripten) in a fresh fork per call, over the same virtual filesystem as bash:
 
 ```
 python({ code: "print(1 + 1)" })
@@ -51,16 +51,21 @@ Tool operations receive absolute paths (pi resolves relative paths against the h
 ## Limitations
 
 - **No output streaming from the sandbox.** just-bash executes a command to completion and returns all output at once, so bash output appears only when the command finishes (buffered stdout first, then stderr — interleaved ordering is not preserved). Native-fallback commands stream as usual. Also note that on abort/timeout just-bash itself discards accumulated stdout (only its abort diagnostic survives); whatever partial output the sandbox does preserve is emitted before the `timeout:<s>`/`aborted` error is raised.
-- **Apply-or-drop: nothing stays pending across turns.** If applying staged changes fails (disk full, permissions, ...), the unapplied remainder is **dropped, not retried** — and the model is told exactly which paths were lost via the discard steering message, alongside an error notification. The overlay is a safety guard, not a durability layer.
-- **Headless outside-project writes are lost by default.** Without a UI, staged changes outside the project root are dropped unless `PI_OVERLAYFS_OUTSIDE_PROJECT=approve` — that is the intended safety posture, but it means e.g. `bash` writing to `~/notes.md` in a headless run does not persist (the model is told via the discard steering message).
+- **Parallel calls can't see each other's project writes.** Forks are isolated until the turn_end merge: two calls in the same batch cannot exchange files through the project — use `/tmp` (shared scratch) for that, or sequence the calls into separate turns. A dependent call must be its own message anyway (batches run in parallel).
+- **Apply-or-drop: nothing stays pending across turns.** If applying the merged changes fails per entry (disk full, permissions, ...), the failed entries are **discarded, not retried** — and the model is told exactly which paths were lost via the discard steering message, alongside an error notification. The overlay is a safety guard, not a durability layer.
+- **Headless outside-project writes are lost by default.** Without a UI, staged changes outside the project root are discarded unless `PI_OVERLAYFS_OUTSIDE_PROJECT=approve` — that is the intended safety posture, but it means e.g. `bash` writing to `~/notes.md` in a headless run does not persist (the model is told via the discard steering message).
 
 ## Concurrency
 
-The finisher needs no concurrency control of its own: `turn_end` fires only after pi has awaited **every** tool execution in the batch, and pi awaits the finisher before the next LLM call — nothing can be in flight when it runs.
+There are **no locks** anywhere in this extension. Safety comes from the fork topology and pi's loop structure:
 
-Mutating **executions** (sandboxed bash, python, write, edit) are still serialized with a shared async mutex. The remaining reason is the runtime-fallback abort-discard (H1): it drops what an aborted run staged, and path-level before/after attribution cannot separate same-window writers — a concurrent sibling's writes would be silently discarded along with the aborted run's. Native-route bash commands never touch the overlay and run concurrently as before.
+- Every mutating call writes only to its **private fork**, so concurrent calls can't interleave destructively or see half-staged state.
+- A failed/aborted call's fork is simply never registered — that is the entire "discard" (the fork *is* the attribution; there is nothing to clean up).
+- Registration is a synchronous `push`; `/tmp` scratch ops are atomic per op with ordinary shared-fs semantics.
+- Merge+apply runs at `turn_end`, which pi emits only after awaiting **every** execution in the batch, and pi awaits the finisher before the next LLM call — nothing can be in flight. Merge conflicts are deterministic (later `changedAt` wins).
+- Native-route bash commands never touch any fork and run concurrently as before.
 
-**Planned (Phase 2):** per-call overlay branches with a deterministic merge at `turn_end` (the branch *is* the attribution — aborted calls simply drop their branch, conflicts resolve newest-wins). That removes the mutex entirely and lets mutating executions run concurrently. Finisher errors are reported via notification/console and never modify or break tool results.
+Finisher errors are reported via notification/console and never modify or break tool results.
 
 ## Configuration
 
@@ -73,7 +78,7 @@ Mutating **executions** (sandboxed bash, python, write, edit) are still serializ
 ```bash
 npm install
 npm run typecheck   # tsc --noEmit
-npm test            # vitest (unit tests against a real sandbox on temp dirs)
+npm test            # vitest (unit tests against a real vfs template on temp dirs)
 npm run build       # emit dist/
 ```
 

@@ -18,7 +18,7 @@
 		"test": "vitest run"
 	},
 	"dependencies": {
-		"@jerryan/just-bash": "^3.5.0"
+		"@jerryan/just-bash": "^3.7.0"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",

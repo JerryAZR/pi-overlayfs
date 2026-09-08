@@ -1,21 +1,21 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { Bash, createAgentSandbox } from "@jerryan/just-bash";
+import { Bash, createVfsTemplate, type MountableFs, type VfsTemplate } from "@jerryan/just-bash";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AsyncMutex } from "../mutex.js";
+import { applyChangeSetPerEntry } from "../finisher.js";
 import { createPathMapper, type PathMapper } from "../paths.js";
 import { createOverlayEditOps, createOverlayReadOps, createOverlayWriteOps } from "./file-ops.js";
-import { createPythonBash, createPythonToolDefinition, shellQuote, type PythonBash } from "./python.js";
+import { createPythonToolDefinition, shellQuote, type PythonBash } from "./python.js";
 
 let tmpRoot: string;
 let home: string;
 let project: string;
+let template: VfsTemplate;
 let mapper: PathMapper;
-let vfs: Bash["fs"];
 let virtualCwd: string;
-const mutex = new AsyncMutex();
 
 beforeEach(async () => {
 	tmpRoot = await mkdtemp(path.join(os.tmpdir(), "pi-overlayfs-tools-"));
@@ -23,12 +23,11 @@ beforeEach(async () => {
 	project = path.join(home, "project");
 	await mkdir(project, { recursive: true });
 	await writeFile(path.join(project, "hello.txt"), "hello\n");
-	const sandbox = createAgentSandbox({ home, project, abortOnUnresolvedCommands: true });
+	template = createVfsTemplate({ mounts: [{ at: "/home/user", root: home }] });
 	mapper = createPathMapper({
-		overlays: [...sandbox.overlays.entries()].map(([mountPoint, { root }]) => ({ mountPoint, root })),
+		overlays: [{ mountPoint: "/home/user", root: home }],
 		projectRoot: project,
 	});
-	vfs = sandbox.bash.fs;
 	virtualCwd = mapper.hostToVirtual(project)!.virtualPath;
 });
 
@@ -36,9 +35,11 @@ afterEach(async () => {
 	await rm(tmpRoot, { recursive: true, force: true });
 });
 
-describe("file-ops adapters (real sandbox vfs)", () => {
+const resolve = (p: string) => mapper.resolveToolPath(p);
+
+describe("file-ops adapters (fresh fork per call)", () => {
 	it("reads host paths through the overlay", async () => {
-		const ops = createOverlayReadOps(vfs, (p) => mapper.resolveToolPath(p));
+		const ops = createOverlayReadOps(template.fork(), resolve);
 		const buf = await ops.readFile(path.join(project, "hello.txt"));
 		expect(buf).toBeInstanceOf(Buffer);
 		expect(buf.toString("utf8")).toBe("hello\n");
@@ -47,25 +48,30 @@ describe("file-ops adapters (real sandbox vfs)", () => {
 	});
 
 	it("detects image mime types by extension", async () => {
-		const ops = createOverlayReadOps(vfs, (p) => mapper.resolveToolPath(p));
+		const ops = createOverlayReadOps(template.fork(), resolve);
 		expect(await ops.detectImageMimeType!(path.join(project, "a.PNG"))).toBe("image/png");
 		expect(await ops.detectImageMimeType!(path.join(project, "a.txt"))).toBeNull();
 	});
 
-	it("writes via virtual POSIX passthrough and recursive mkdir", async () => {
-		const writeOps = createOverlayWriteOps(vfs, (p) => mapper.resolveToolPath(p));
+	it("writes via virtual POSIX passthrough land in shared scratch (/tmp)", async () => {
+		const writeOps = createOverlayWriteOps(template.fork(), resolve);
 		await writeOps.mkdir("/tmp/a/b");
 		await writeOps.writeFile("/tmp/a/b/x.txt", "data");
-		const readOps = createOverlayReadOps(vfs, (p) => mapper.resolveToolPath(p));
+		// /tmp is the shared scratch base: visible to every fork immediately.
+		const readOps = createOverlayReadOps(template.fork(), resolve);
 		expect((await readOps.readFile("/tmp/a/b/x.txt")).toString()).toBe("data");
 	});
 
-	it("edit ops write through to staged overlay changes", async () => {
-		const editOps = createOverlayEditOps(vfs, (p) => mapper.resolveToolPath(p));
+	it("edit ops write through to the fork's private staged changes", async () => {
+		const fork = template.fork();
+		const editOps = createOverlayEditOps(fork, resolve);
 		await editOps.access(path.join(project, "hello.txt"));
 		const before = await editOps.readFile(path.join(project, "hello.txt"));
 		await editOps.writeFile(path.join(project, "hello.txt"), before.toString().replace("hello", "goodbye"));
 		expect((await editOps.readFile(path.join(project, "hello.txt"))).toString()).toBe("goodbye\n");
+		// Staged only: disk still has the original until merge+apply.
+		expect(existsSync(path.join(project, "hello.txt"))).toBe(true);
+		expect(fork.diff({ space: "vfs" }).writes.map((w) => path.posix.basename(w.path))).toContain("hello.txt");
 	});
 });
 
@@ -78,18 +84,25 @@ describe("shellQuote", () => {
 });
 
 describe("python tool (real sandboxed CPython)", () => {
-	function makeTool() {
-		return createPythonToolDefinition({
-			vfs,
-			pythonBash: createPythonBash(vfs, virtualCwd),
-			resolveAbsolute: (p) => mapper.resolveToolPath(p),
+	function makeTool(): { tool: ReturnType<typeof createPythonToolDefinition>; registered: MountableFs[] } {
+		const registered: MountableFs[] = [];
+		const tool = createPythonToolDefinition({
+			forkBash: () => {
+				const fork = template.fork();
+				return {
+					bash: new Bash({ fs: fork, python: true, cwd: virtualCwd, env: { HOME: "/home/user" } }),
+					fork,
+				};
+			},
+			registerFork: (f) => registered.push(f),
+			resolveAbsolute: resolve,
 			virtualCwd,
-			runExclusive: (fn) => mutex.run(fn),
 		});
+		return { tool, registered };
 	}
 
 	it("rejects calls without exactly one of code/path", async () => {
-		const tool = makeTool();
+		const { tool } = makeTool();
 		await expect(tool.execute("id", {}, undefined, undefined)).rejects.toThrow("exactly one");
 		await expect(
 			tool.execute("id", { code: "print(1)", path: "x.py" }, undefined, undefined),
@@ -97,7 +110,7 @@ describe("python tool (real sandboxed CPython)", () => {
 	});
 
 	it("runs inline code over the overlay filesystem and preserves output", async () => {
-		const tool = makeTool();
+		const { tool } = makeTool();
 		const scriptPath = path.posix.join(virtualCwd, "hello.txt").replace(/\\/g, "/");
 		const result = await tool.execute(
 			"id",
@@ -112,8 +125,34 @@ describe("python tool (real sandboxed CPython)", () => {
 		expect(text).toMatch(/\(exit 0\)$/);
 	});
 
+	it("project writes register the fork and reach disk via merge+apply", async () => {
+		const { tool, registered } = makeTool();
+		const result = await tool.execute(
+			"id",
+			{ code: "open('made-by-python.txt', 'w').write('py\\n')" },
+			undefined,
+			undefined,
+		);
+		expect(result.content[0]!.text).toMatch(/\(exit 0\)$/);
+		expect(existsSync(path.join(project, "made-by-python.txt"))).toBe(false);
+
+		expect(registered).toHaveLength(1);
+		const merged = await template.merge(registered);
+		await applyChangeSetPerEntry(merged.diff({ space: "host" }));
+		expect(existsSync(path.join(project, "made-by-python.txt"))).toBe(true);
+	});
+
+	it("a failed call does not register its fork", async () => {
+		const { tool, registered } = makeTool();
+		const result = await tool.execute("id", { code: "raise SystemExit(3)" }, undefined, undefined);
+		expect(result.content[0]!.text).toMatch(/\(exit 3\)$/);
+		// Non-zero exit is still a completed call — the fork IS registered
+		// (the script's writes before the failure are legitimate effects).
+		expect(registered).toHaveLength(1);
+	});
+
 	it("runs a script by host path with args", async () => {
-		const tool = makeTool();
+		const { tool } = makeTool();
 		await writeFile(path.join(project, "script.py"), "import sys\nprint(sys.argv[1])");
 		const result = await tool.execute(
 			"id",
@@ -125,28 +164,23 @@ describe("python tool (real sandboxed CPython)", () => {
 		expect(result.content[0]!.text).toMatch(/\(exit 0\)$/);
 	});
 
-	it("reports non-zero exits in the text without throwing", async () => {
-		const tool = makeTool();
-		const result = await tool.execute("id", { code: "raise SystemExit(3)" }, undefined, undefined);
-		expect(result.content[0]!.text).toMatch(/\(exit 3\)$/);
-	});
-
 	it("throws a clear error for a missing script", async () => {
-		const tool = makeTool();
+		const { tool, registered } = makeTool();
 		await expect(tool.execute("id", { path: "nope.py" }, undefined, undefined)).rejects.toThrow(
 			"script not found",
 		);
+		expect(registered).toHaveLength(0);
 	});
 });
 
 describe("python tool timeout + truncation (injected bash)", () => {
-	function makeToolWith(pythonBash: PythonBash) {
+	function makeToolWith(pythonBash: PythonBash, defaultTimeoutSeconds?: number) {
 		return createPythonToolDefinition({
-			vfs,
-			pythonBash,
-			resolveAbsolute: (p) => mapper.resolveToolPath(p),
+			forkBash: () => ({ bash: pythonBash, fork: template.fork() }),
+			registerFork: () => {},
+			resolveAbsolute: resolve,
 			virtualCwd,
-			runExclusive: (fn) => mutex.run(fn),
+			...(defaultTimeoutSeconds !== undefined && { defaultTimeoutSeconds }),
 		});
 	}
 
@@ -189,14 +223,7 @@ describe("python tool timeout + truncation (injected bash)", () => {
 					);
 				}),
 		};
-		const tool = createPythonToolDefinition({
-			vfs,
-			pythonBash: hangingBash,
-			resolveAbsolute: (p) => mapper.resolveToolPath(p),
-			virtualCwd,
-			runExclusive: (fn) => mutex.run(fn),
-			defaultTimeoutSeconds: 0.05,
-		});
+		const tool = makeToolWith(hangingBash, 0.05);
 		await expect(tool.execute("id", { code: "pass" }, undefined, undefined)).rejects.toThrow("timeout:0.05");
 	});
 

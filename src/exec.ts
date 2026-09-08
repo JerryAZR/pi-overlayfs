@@ -46,22 +46,6 @@ export interface BashExecDeps {
 	execSandboxed(command: string, virtualCwd: string): Promise<SandboxRunResult>;
 	/** Execute natively on the host (pi's local shell operations). Streams itself. */
 	execNative(command: string, hostCwd: string): Promise<{ exitCode: number | null }>;
-	/**
-	 * Discard the staged state the aborted run created, before the native
-	 * rerun. Invoked INSIDE runExclusive (see below): the fail-fast abort
-	 * leaves the already-executed prefix's writes staged in the overlay, and
-	 * dropping them must be atomic with the sandboxed run — otherwise a
-	 * concurrent mutating tool (parallel tool mode) can stage writes in the
-	 * gap and have them silently discarded.
-	 */
-	discardAbortedStaged?(): void | Promise<void>;
-	/**
-	 * Mutual exclusion shared with the other mutating tools and the finisher.
-	 * The lock is held continuously across snapshot -> sandboxed run ->
-	 * discard; the native rerun itself runs outside it (it never touches the
-	 * overlay).
-	 */
-	runExclusive?<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 export interface BashExecRequest {
@@ -80,9 +64,10 @@ export interface BashExecRequest {
  *  2. static analysis finds unresolved commands   -> native passthrough (no asking).
  *  3. sandboxed execution; output emitted only now (buffered until the route
  *     is decided, so fallbacks never duplicate output).
- *  4. runtime unresolved commands (fail-fast abort
- *     surfaced in the result)                    -> discard aborted-run staged
- *     state (beforeNativeRerun), then rerun natively.
+ *  4. runtime unresolved commands (fail-fast abort surfaced in the result)
+ *     -> rerun natively. The aborted run's fork is simply never registered
+ *     (see createOverlayBashOperations), so its partial writes never reach
+ *     the merge — that is the whole H1 discard, by topology.
  */
 export async function execBashWithFallback(
 	request: BashExecRequest,
@@ -120,30 +105,13 @@ export async function execBashWithFallback(
 		return { exitCode: result.exitCode, route: "native-unresolved-static" };
 	}
 
-	const virtualCwd = request.virtualCwd;
-
-	const runExclusive: <T>(fn: () => Promise<T>) => Promise<T> = deps.runExclusive ?? ((fn) => fn());
-
-	// Snapshot -> sandboxed run -> discard-of-aborted-staged-state is ONE
-	// locked region: a concurrent mutating tool can only stage writes before
-	// or after it, never in between (they would otherwise be discarded too).
-	const attempt = await runExclusive(async () => {
-		const sandboxed = await deps.execSandboxed(request.command, virtualCwd);
-		if (sandboxed.unresolvedCommands && sandboxed.unresolvedCommands.length > 0) {
-			await deps.discardAbortedStaged?.();
-			return { fallback: true as const };
-		}
-		return { fallback: false as const, sandboxed };
-	});
-
-	if (attempt.fallback) {
-		// Native rerun outside the lock: it never touches the overlay.
+	const sandboxed = await deps.execSandboxed(request.command, request.virtualCwd);
+	if (sandboxed.unresolvedCommands && sandboxed.unresolvedCommands.length > 0) {
 		const result = await deps.execNative(request.command, request.hostCwd);
 		return { exitCode: result.exitCode, route: "native-unresolved-runtime" };
 	}
 
 	// Route stays sandboxed: now emit the buffered output (stdout then stderr).
-	const { sandboxed } = attempt;
 	if (sandboxed.stdout) request.onData(Buffer.from(sandboxed.stdout, "utf8"));
 	if (sandboxed.stderr) request.onData(Buffer.from(sandboxed.stderr, "utf8"));
 	return { exitCode: sandboxed.exitCode, route: "sandboxed" };
@@ -265,33 +233,21 @@ export async function runSandboxed(
 }
 
 /**
- * Build BashOperations that route through the overlay sandbox with native
- * fallback. `localOps` is pi's createLocalBashOperations() result.
+ * Build BashOperations that route through per-call COW forks with native
+ * fallback. Each call with a mappable cwd gets a fresh fork + Bash
+ * (`forkBash`); when the route stays sandboxed the fork is handed to
+ * `registerFork` for the turn_end merge. Native routes and aborted/failed
+ * runs never register — their fork (and its partial writes) is discarded,
+ * which is what makes concurrent execution safe without any locking.
+ * `localOps` is pi's createLocalBashOperations() result.
  */
-export function createOverlayBashOperations(options: {
-	bash: SandboxBash;
+export function createOverlayBashOperations<F>(options: {
+	/** Fresh Bash over a fresh template fork, plus the fork to register on success. */
+	forkBash(): { bash: SandboxBash; fork: F };
+	/** Register a sandboxed run's fork for the turn_end merge. */
+	registerFork(fork: F): void;
 	mapCwd: (hostCwd: string) => string | null;
 	localOps: BashOperations;
-	/** Serialize sandboxed execution with other mutating tools and the finisher. */
-	runExclusive?<T>(fn: () => Promise<T>): Promise<T>;
-	/**
-	 * Staged-state guards for the runtime-fallback path (H1). getStagedPaths
-	 * snapshots the pending overlay change paths before a sandboxed run;
-	 * dropStagedPathsExcept discards every pending change NOT in the snapshot,
-	 * i.e. exactly what the aborted run staged. Both run under runExclusive
-	 * (snapshot -> sandboxed run -> discard is one locked region).
-	 *
-	 * Known residue (path granularity): the keep-set is path-based, so if the
-	 * aborted run overwrote a path that was ALREADY pending before the run —
-	 * only reachable after a prior finisher failure left entries unapplied —
-	 * that path keeps the aborted run's content, and a later finisher retry
-	 * may apply it over the native rerun's result. Accepted: the window
-	 * requires a finisher failure first, and the alternative (content-level
-	 * snapshots) buys little there. When the guards are omitted entirely,
-	 * runtime fallbacks keep the aborted run's staged writes (unsafe).
-	 */
-	getStagedPaths?(): string[];
-	dropStagedPathsExcept?(keepPaths: string[]): void;
 	/**
 	 * Timeout (seconds) applied when the model omits `timeout` — covers BOTH
 	 * the sandboxed and native routes. Defaults to DEFAULT_TIMEOUT_SECONDS;
@@ -306,26 +262,20 @@ export function createOverlayBashOperations(options: {
 					? { ...callOptions, timeout: options.defaultTimeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS }
 					: callOptions;
 			const virtualCwd = options.mapCwd(hostCwd);
-			let stagedBeforeRun: string[] | undefined;
+			if (virtualCwd === null) {
+				const result = await options.localOps.exec(command, hostCwd, effectiveCallOptions);
+				return { exitCode: result.exitCode };
+			}
+			const { bash, fork } = options.forkBash();
 			const outcome = await execBashWithFallback(
 				{ command, hostCwd, virtualCwd, onData: effectiveCallOptions.onData },
 				{
-					analyze: (cmd) => options.bash.analyzeCommands(cmd),
-					execSandboxed: (cmd, cwd) => {
-						// Runs inside runExclusive (wired below), so the snapshot is
-						// atomic with the run and the discard.
-						stagedBeforeRun = options.getStagedPaths?.();
-						return runSandboxed(options.bash, cmd, { ...effectiveCallOptions, virtualCwd: cwd });
-					},
+					analyze: (cmd) => bash.analyzeCommands(cmd),
+					execSandboxed: (cmd, cwd) => runSandboxed(bash, cmd, { ...effectiveCallOptions, virtualCwd: cwd }),
 					execNative: (cmd, cwd) => options.localOps.exec(cmd, cwd, effectiveCallOptions),
-					discardAbortedStaged: () => {
-						if (stagedBeforeRun && options.dropStagedPathsExcept) {
-							options.dropStagedPathsExcept(stagedBeforeRun);
-						}
-					},
-					runExclusive: options.runExclusive,
 				},
 			);
+			if (outcome.route === "sandboxed") options.registerFork(fork);
 			return { exitCode: outcome.exitCode };
 		},
 	};

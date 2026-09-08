@@ -1,13 +1,13 @@
 /**
- * Custom "python" tool: run sandboxed CPython (just-bash python option) over
- * the same overlay filesystem as bash. Inline code is staged to a fresh
- * /tmp/.pi-py-<n>.py script; script paths accept host or virtual POSIX forms.
+ * Custom "python" tool: run sandboxed CPython (just-bash python option) in a
+ * fresh COW fork per call. Inline code is staged to a fresh
+ * /tmp/.pi-py-<n>.py script (shared scratch, visible to all forks); script
+ * paths accept host or virtual POSIX forms.
  */
 import path from "node:path";
 import { truncateHead } from "@earendil-works/pi-coding-agent";
-import { Bash, type BashExecResult, type IFileSystem } from "@jerryan/just-bash";
+import type { BashExecResult } from "@jerryan/just-bash";
 import { Type } from "typebox";
-import { normalizeDirectoryModes } from "../dir-modes.js";
 import { DEFAULT_TIMEOUT_SECONDS, resolveTimeoutMs } from "../exec.js";
 import type { OverlayVfs, ToolPathResolver } from "./file-ops.js";
 
@@ -15,29 +15,15 @@ export interface PythonBash {
 	exec(command: string, options?: { cwd?: string; signal?: AbortSignal }): Promise<BashExecResult>;
 }
 
-/**
- * Build the Bash instance backing the python tool: python enabled, directory
- * modes normalized for the Windows CPython worker (see dir-modes.ts), and
- * HOME=/home/user matching what createAgentSandbox sets for the main bash.
- */
-export function createPythonBash(fs: IFileSystem, virtualCwd: string): Bash {
-	return new Bash({
-		fs: normalizeDirectoryModes(fs),
-		python: true,
-		cwd: virtualCwd,
-		env: { HOME: "/home/user" },
-	});
-}
-
-export interface PythonToolDeps {
-	vfs: OverlayVfs;
-	pythonBash: PythonBash;
+export interface PythonToolDeps<F extends OverlayVfs> {
+	/** Fresh python-enabled Bash over a fresh template fork, per call. */
+	forkBash(): { bash: PythonBash; fork: F };
+	/** Register a successful call's fork for the turn_end merge. */
+	registerFork(fork: F): void;
 	/** paths.ts resolveToolPath for absolute inputs. */
 	resolveAbsolute: ToolPathResolver;
 	/** Virtual cwd of the project inside the sandbox. */
 	virtualCwd: string;
-	/** Serialize with other mutating tools and the finisher. */
-	runExclusive<T>(fn: () => Promise<T>): Promise<T>;
 	/** Timeout (seconds) when the model omits `timeout`. Defaults to DEFAULT_TIMEOUT_SECONDS. */
 	defaultTimeoutSeconds?: number;
 }
@@ -79,7 +65,7 @@ function textResult(text: string) {
 	return { content: [{ type: "text" as const, text }], details: undefined };
 }
 
-export function createPythonToolDefinition(deps: PythonToolDeps) {
+export function createPythonToolDefinition<F extends OverlayVfs>(deps: PythonToolDeps<F>) {
 	let scriptCounter = 0;
 
 	return {
@@ -109,73 +95,76 @@ export function createPythonToolDefinition(deps: PythonToolDeps) {
 			const timeoutSeconds = params.timeout ?? deps.defaultTimeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS;
 			const timeoutMs = resolveTimeoutMs(timeoutSeconds);
 
-			return deps.runExclusive(async () => {
+			if (signal?.aborted) throw new Error("aborted");
+
+			const { bash, fork } = deps.forkBash();
+			const virtualCwd = params.cwd
+				? toVirtual(params.cwd, deps.virtualCwd, deps.resolveAbsolute)
+				: deps.virtualCwd;
+
+			// The CPython worker expects /tmp to exist in the vfs (shared
+			// scratch — immediately visible to every fork).
+			await fork.mkdir("/tmp", { recursive: true });
+
+			let scriptPath: string;
+			if (hasCode) {
+				scriptPath = `/tmp/.pi-py-${scriptCounter++}.py`;
+				await fork.mkdir(path.posix.dirname(scriptPath), { recursive: true });
+				await fork.writeFile(scriptPath, params.code as string, { encoding: "utf8" });
+			} else {
+				scriptPath = toVirtual(params.path as string, virtualCwd, deps.resolveAbsolute);
+				if (!(await fork.exists(scriptPath))) {
+					throw new Error(`python: script not found: ${params.path}`);
+				}
+			}
+
+			const args = (params.args ?? []).map(shellQuote);
+			const command = [`python3 ${shellQuote(scriptPath)}`, ...args].join(" ");
+
+			const controller = new AbortController();
+			const onAbort = () => controller.abort();
+			signal?.addEventListener("abort", onAbort, { once: true });
+			let timedOut = false;
+			const timer =
+				timeoutMs !== undefined
+					? setTimeout(() => {
+							timedOut = true;
+							controller.abort();
+						}, timeoutMs)
+					: undefined;
+
+			let result: BashExecResult;
+			try {
+				result = await bash.exec(command, { cwd: virtualCwd, signal: controller.signal });
+			} catch (error) {
 				if (signal?.aborted) throw new Error("aborted");
+				if (timedOut) throw new Error(`timeout:${timeoutSeconds}`);
+				throw error;
+			} finally {
+				if (timer) clearTimeout(timer);
+				signal?.removeEventListener("abort", onAbort);
+			}
+			if (signal?.aborted) throw new Error("aborted");
+			if (timedOut) {
+				// Preserve hang diagnostics: partial output rides along with the
+				// timeout error message.
+				let detail = "";
+				if (result.stdout) detail += `\n${result.stdout}`;
+				if (result.stderr) detail += `\n--- stderr ---\n${result.stderr}`;
+				throw new Error(`timeout:${timeoutSeconds}${detail}`);
+			}
 
-				const virtualCwd = params.cwd
-					? toVirtual(params.cwd, deps.virtualCwd, deps.resolveAbsolute)
-					: deps.virtualCwd;
+			// The call succeeded: its project writes land in the merge.
+			deps.registerFork(fork);
 
-				// The CPython worker expects /tmp to exist in the vfs.
-				await deps.vfs.mkdir("/tmp", { recursive: true });
-
-				let scriptPath: string;
-				if (hasCode) {
-					scriptPath = `/tmp/.pi-py-${scriptCounter++}.py`;
-					await deps.vfs.mkdir(path.posix.dirname(scriptPath), { recursive: true });
-					await deps.vfs.writeFile(scriptPath, params.code as string, { encoding: "utf8" });
-				} else {
-					scriptPath = toVirtual(params.path as string, virtualCwd, deps.resolveAbsolute);
-					if (!(await deps.vfs.exists(scriptPath))) {
-						throw new Error(`python: script not found: ${params.path}`);
-					}
-				}
-
-				const args = (params.args ?? []).map(shellQuote);
-				const command = [`python3 ${shellQuote(scriptPath)}`, ...args].join(" ");
-
-				const controller = new AbortController();
-				const onAbort = () => controller.abort();
-				signal?.addEventListener("abort", onAbort, { once: true });
-				let timedOut = false;
-				const timer =
-					timeoutMs !== undefined
-						? setTimeout(() => {
-								timedOut = true;
-								controller.abort();
-							}, timeoutMs)
-						: undefined;
-
-				let result: BashExecResult;
-				try {
-					result = await deps.pythonBash.exec(command, { cwd: virtualCwd, signal: controller.signal });
-				} catch (error) {
-					if (signal?.aborted) throw new Error("aborted");
-					if (timedOut) throw new Error(`timeout:${timeoutSeconds}`);
-					throw error;
-				} finally {
-					if (timer) clearTimeout(timer);
-					signal?.removeEventListener("abort", onAbort);
-				}
-				if (signal?.aborted) throw new Error("aborted");
-				if (timedOut) {
-					// Preserve hang diagnostics: partial output rides along with the
-					// timeout error message.
-					let detail = "";
-					if (result.stdout) detail += `\n${result.stdout}`;
-					if (result.stderr) detail += `\n--- stderr ---\n${result.stderr}`;
-					throw new Error(`timeout:${timeoutSeconds}${detail}`);
-				}
-
-				let text = result.stdout;
-				if (result.stderr) text += `\n--- stderr ---\n${result.stderr}`;
-				const truncation = truncateHead(text);
-				if (truncation.truncated) {
-					text = `${truncation.content}\n\n[Output truncated: ${truncation.totalLines} lines total, showing first ${truncation.outputLines}]`;
-				}
-				text += `\n(exit ${result.exitCode})`;
-				return textResult(text);
-			});
+			let text = result.stdout;
+			if (result.stderr) text += `\n--- stderr ---\n${result.stderr}`;
+			const truncation = truncateHead(text);
+			if (truncation.truncated) {
+				text = `${truncation.content}\n\n[Output truncated: ${truncation.totalLines} lines total, showing first ${truncation.outputLines}]`;
+			}
+			text += `\n(exit ${result.exitCode})`;
+			return textResult(text);
 		},
 	};
 }

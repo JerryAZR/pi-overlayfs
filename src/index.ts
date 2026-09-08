@@ -1,16 +1,21 @@
 /**
  * pi-overlayfs — route pi's file-touching tools (bash, read, write, edit +
- * a new python tool) through a virtual overlay filesystem
- * (@jerryan/just-bash createAgentSandbox).
+ * a new python tool) through per-call copy-on-write filesystem forks
+ * (@jerryan/just-bash createVfsTemplate).
  *
- * Writes stage in a copy-on-write memory layer over the real home/project
- * dirs. After each mutating tool call a finisher applies staged changes to
- * disk: auto-approved inside the project root, user-confirmed
- * (ctx.ui.confirm) outside it. Headless (no UI), outside-project changes are
- * dropped unless PI_OVERLAYFS_OUTSIDE_PROJECT=approve.
+ * Every tool call gets a fresh COW fork over the real home (and project, when
+ * outside home) dirs; /tmp is shared scratch. Calls run fully concurrently —
+ * isolation comes from the topology, not from locking. At turn_end the
+ * turn's forks are merged (deterministic: later changedAt wins) into one
+ * change set, which a finisher applies to disk: auto-approved inside the
+ * project root, user-confirmed (ctx.ui.confirm) outside it. Headless (no
+ * UI), outside-project changes are dropped unless
+ * PI_OVERLAYFS_OUTSIDE_PROJECT=approve. Aborted/failed calls simply never
+ * register their fork, so their partial writes never reach the merge.
  */
 import { existsSync, statSync } from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { Type } from "typebox";
 import {
 	createBashToolDefinition,
@@ -23,7 +28,7 @@ import {
 	createWriteToolDefinition,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { type AgentSandbox, createAgentSandbox } from "@jerryan/just-bash";
+import { Bash, createVfsTemplate, type MountableFs, type VfsTemplate } from "@jerryan/just-bash";
 import { createOverlayBashOperations, DEFAULT_TIMEOUT_SECONDS } from "./exec.js";
 
 /**
@@ -37,72 +42,73 @@ const BASH_SPLIT_GUIDELINE =
 	"(git, npm, cargo, node, python, ...) natively on the host. Never combine rm, mv or rmdir with host-run " +
 	"dev tools in a single call - the deletion must be its own separate bash call. Combining rm/mv with " +
 	"other file commands in one call is fine.";
-import { dropStagedPaths, runFinisher } from "./finisher.js";
-import { AsyncMutex } from "./mutex.js";
+import { applyChangeSetPerEntry, runFinisher } from "./finisher.js";
 import { canonicalizeHostPathFs, createPathMapper, type PathMapper } from "./paths.js";
-import { createOverlayEditOps, createOverlayReadOps, createOverlayWriteOps, type OverlayVfs } from "./tools/file-ops.js";
-import { createPythonBash, createPythonToolDefinition } from "./tools/python.js";
+import { createOverlayEditOps, createOverlayReadOps, createOverlayWriteOps } from "./tools/file-ops.js";
+import { createPythonToolDefinition } from "./tools/python.js";
 
 interface SessionState {
-	sandbox: AgentSandbox;
+	template: VfsTemplate;
 	mapper: PathMapper;
 	virtualCwd: string;
+	/** Forks of this turn's successful mutating calls, merged at turn_end. */
+	turnForks: MountableFs[];
 }
 
 export default function (pi: ExtensionAPI) {
-	// Serializes MUTATING executions (bash sandboxed route, python, write,
-	// edit) so the H1 abort-discard never eats a concurrent sibling's staged
-	// writes — path-level before/after attribution cannot separate same-window
-	// writers. Phase 2 replaces this with per-call overlay branches + merge
-	// (the branch IS the attribution), after which executions go concurrent.
-	const mutex = new AsyncMutex();
 	let state: SessionState | undefined;
 
 	pi.on("session_start", async (_event, ctx) => {
 		// Canonicalize up front (symlinked cwd / $HOME, e.g. macOS /tmp): the
-		// sandbox realpaths its overlay roots internally, and the mapper must
+		// template realpaths its mount roots internally, and the mapper must
 		// compare against the same canonical spelling or every lookup misses
 		// (silent native fallback + outside-project misclassification).
 		const cwd = canonicalizeHostPathFs(ctx.cwd);
 		const home = canonicalizeHostPathFs(os.homedir());
-		const sandbox = createAgentSandbox({
-			home,
-			project: cwd,
-			abortOnUnresolvedCommands: true,
-		});
+		// Same topology as the long-lived agent sandbox: the project is a
+		// subpath of the home overlay when inside home, a second mount at
+		// /project otherwise.
+		const rel = path.relative(home, cwd);
+		const projectInsideHome = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+		const mounts = projectInsideHome
+			? [{ at: "/home/user", root: home }]
+			: [
+					{ at: "/home/user", root: home },
+					{ at: "/project", root: cwd },
+				];
+		const template = createVfsTemplate({ mounts });
 		const mapper = createPathMapper({
-			overlays: [...sandbox.overlays.entries()].map(([mountPoint, { root }]) => ({ mountPoint, root })),
+			overlays: mounts.map((m) => ({ mountPoint: m.at, root: m.root })),
 			projectRoot: cwd,
 		});
 		const virtualCwd = mapper.hostToVirtual(cwd)?.virtualPath ?? "/";
-		const vfs: OverlayVfs = sandbox.bash.fs;
-		const pythonBash = createPythonBash(sandbox.bash.fs, virtualCwd);
-		state = { sandbox, mapper, virtualCwd };
+		const active: SessionState = { template, mapper, virtualCwd, turnForks: [] };
+		state = active;
 
 		const resolve = (absolutePath: string) => mapper.resolveToolPath(absolutePath);
 		const localBashOps = createLocalBashOperations();
+		const registerFork = (fork: MountableFs) => {
+			active.turnForks.push(fork);
+		};
 
-		// bash: operations carry the sandbox routing; the built-in definition
+		// bash: operations carry the fork routing; the built-in definition
 		// (prompt, renderers, truncation) is reused unchanged.
 		const bashOps = createOverlayBashOperations({
-			bash: sandbox.bash,
+			forkBash: () => {
+				const fork = template.fork();
+				return {
+					bash: new Bash({
+						fs: fork,
+						cwd: virtualCwd,
+						env: { HOME: "/home/user" },
+						abortOnUnresolvedCommands: true,
+					}),
+					fork,
+				};
+			},
+			registerFork,
 			mapCwd: (hostCwd) => mapper.hostToVirtual(hostCwd)?.virtualPath ?? null,
 			localOps: localBashOps,
-			runExclusive: (fn) => mutex.run(fn),
-			getStagedPaths: () => [...sandbox.diff().deletions, ...sandbox.diff().writes.map((w) => w.path)],
-			dropStagedPathsExcept: (keepPaths) => {
-				// NOTE (path granularity): the keep-set is path-based. Defense in
-				// depth only: pre-existing pending state used to be reachable via
-				// a finisher failure, but the apply-or-drop policy now drops all
-				// residue on failure, so the keep-set is normally the empty set.
-				const keep = new Set(keepPaths);
-				const pending = sandbox.diff();
-				const stale = [
-					...pending.deletions.filter((p) => !keep.has(p)),
-					...pending.writes.map((w) => w.path).filter((p) => !keep.has(p)),
-				];
-				dropStagedPaths(sandbox, mapper, stale);
-			},
 		});
 		const bashDef = createBashToolDefinition(cwd, { operations: bashOps });
 		pi.registerTool({
@@ -118,43 +124,69 @@ export default function (pi: ExtensionAPI) {
 			}),
 		});
 
-		// read/write/edit: built-in definitions, execute delegated to built-in
-		// tools created with overlay operations (hoisted here, closing over vfs).
-		const readTool = createReadTool(cwd, { operations: createOverlayReadOps(vfs, resolve) });
+		// read/write/edit: built-in definitions; each call runs against a fresh
+		// fork (live disk for reads; registered for the merge on write success).
 		const readDef = createReadToolDefinition(cwd);
 		pi.registerTool({
 			...readDef,
-			execute: (id, params, signal, onUpdate) => readTool.execute(id, params, signal, onUpdate),
+			execute: (id, params, signal, onUpdate) =>
+				createReadTool(cwd, { operations: createOverlayReadOps(template.fork(), resolve) }).execute(
+					id,
+					params,
+					signal,
+					onUpdate,
+				),
 		});
 
-		const writeTool = createWriteTool(cwd, { operations: createOverlayWriteOps(vfs, resolve) });
 		const writeDef = createWriteToolDefinition(cwd);
 		pi.registerTool({
 			...writeDef,
-			execute: (id, params, signal, onUpdate) =>
-				mutex.run(() => writeTool.execute(id, params, signal, onUpdate)),
+			execute: async (id, params, signal, onUpdate) => {
+				const fork = template.fork();
+				const result = await createWriteTool(cwd, { operations: createOverlayWriteOps(fork, resolve) }).execute(
+					id,
+					params,
+					signal,
+					onUpdate,
+				);
+				registerFork(fork);
+				return result;
+			},
 		});
 
-		const editTool = createEditTool(cwd, { operations: createOverlayEditOps(vfs, resolve) });
 		const editDef = createEditToolDefinition(cwd);
 		pi.registerTool({
 			...editDef,
-			execute: (id, params, signal, onUpdate) =>
-				mutex.run(() => editTool.execute(id, params, signal, onUpdate)),
+			execute: async (id, params, signal, onUpdate) => {
+				const fork = template.fork();
+				const result = await createEditTool(cwd, { operations: createOverlayEditOps(fork, resolve) }).execute(
+					id,
+					params,
+					signal,
+					onUpdate,
+				);
+				registerFork(fork);
+				return result;
+			},
 		});
 
 		pi.registerTool(
 			createPythonToolDefinition({
-				vfs,
-				pythonBash,
+				forkBash: () => {
+					const fork = template.fork();
+					return {
+						bash: new Bash({ fs: fork, python: true, cwd: virtualCwd, env: { HOME: "/home/user" } }),
+						fork,
+					};
+				},
+				registerFork,
 				resolveAbsolute: resolve,
 				virtualCwd,
-				runExclusive: (fn) => mutex.run(fn),
 			}),
 		);
 
 		ctx.ui.notify(
-			`pi-overlayfs: sandboxing bash/read/write/edit/python over ${[...sandbox.overlays.keys()].join(", ")}`,
+			`pi-overlayfs: sandboxing bash/read/write/edit/python over ${mounts.map((m) => m.at).join(", ")}`,
 			"info",
 		);
 	});
@@ -165,56 +197,60 @@ export default function (pi: ExtensionAPI) {
 
 	// The finisher runs once per turn at turn_end. pi fully awaits every tool
 	// execution in the batch BEFORE emitting turn_end (agent-loop), and awaits
-	// this handler before the next LLM call — so nothing can be in flight and
-	// the finisher sees only quiescent staged state. getSteeringMessages() is
-	// polled immediately after turn_end, so drop warnings land before the
-	// model's next call.
+	// this handler before the next LLM call — so nothing can be in flight when
+	// the turn's forks are merged and applied. getSteeringMessages() is polled
+	// immediately after turn_end, so drop warnings land before the model's
+	// next call.
 	pi.on("turn_end", async (_event, ctx) => {
 		const active = state;
-		if (!active) return;
-		// Fast path: nothing staged → nothing to finish.
-		const pending = active.sandbox.diff();
-		if (pending.writes.length === 0 && pending.deletions.length === 0) return;
-		// Uncontended today (all executions completed before turn_end); the
-		// lock merely preserves the executions-vs-finisher invariant if
-		// background execution ever appears.
-		const report = await mutex.run(async () => {
+		if (!active || active.turnForks.length === 0) return;
+		const forks = active.turnForks;
+		active.turnForks = [];
+
+		let hostDiff;
+		try {
+			const merged = await active.template.merge(forks);
+			hostDiff = merged.diff({ space: "host" });
+		} catch (error) {
+			console.error(`pi-overlayfs: merge failed: ${error instanceof Error ? error.message : error}`);
+			return;
+		}
+		if (hostDiff.writes.length === 0 && hostDiff.deletions.length === 0) return;
+
+		let report;
+		try {
+			report = await runFinisher({
+				diff: () => hostDiff,
+				applyChanges: (subset) => applyChangeSetPerEntry(subset),
+				isUnderProject: (p) => active.mapper.isUnderProject(p),
+				isExistingDirectory: (p) => {
+					try {
+						return existsSync(p) && statSync(p).isDirectory();
+					} catch {
+						return false;
+					}
+				},
+				confirm: ctx.hasUI
+					? (outsidePaths) =>
+							ctx.ui.confirm(
+								`${outsidePaths.length} staged change${outsidePaths.length === 1 ? "" : "s"} outside project root`,
+								`The sandbox staged changes outside the project root:\n\n${outsidePaths.join("\n")}\n\nApply them to disk?`,
+							)
+					: undefined,
+				outsidePolicy: () => process.env.PI_OVERLAYFS_OUTSIDE_PROJECT,
+			});
+		} catch (error) {
+			// Defensive: runFinisher reports apply/confirm failures as data.
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(`pi-overlayfs: finisher failed: ${message}`);
 			try {
-				return await runFinisher({
-					diff: () => active.sandbox.diff(),
-					applyChanges: (subset) => active.sandbox.applyChanges(subset),
-					drop: (realPaths) => dropStagedPaths(active.sandbox, active.mapper, realPaths),
-					isUnderProject: (p) => active.mapper.isUnderProject(p),
-					isExistingDirectory: (p) => {
-						try {
-							return existsSync(p) && statSync(p).isDirectory();
-						} catch {
-							return false;
-						}
-					},
-					confirm: ctx.hasUI
-						? (outsidePaths) =>
-								ctx.ui.confirm(
-									`${outsidePaths.length} staged change${outsidePaths.length === 1 ? "" : "s"} outside project root`,
-									`The sandbox staged changes outside the project root:\n\n${outsidePaths.join("\n")}\n\nApply them to disk?`,
-								)
-						: undefined,
-					outsidePolicy: () => process.env.PI_OVERLAYFS_OUTSIDE_PROJECT,
-				});
-			} catch (error) {
-				// Defensive: runFinisher handles apply/confirm failures internally
-				// (apply-or-drop, see finisher.ts); this is for unexpected errors.
-				const message = error instanceof Error ? error.message : String(error);
-				console.error(`pi-overlayfs: finisher failed: ${message}`);
-				try {
-					ctx.ui.notify(`pi-overlayfs: failed to apply staged changes: ${message}`, "error");
-				} catch {
-					/* no UI */
-				}
-				return undefined;
+				ctx.ui.notify(`pi-overlayfs: failed to apply staged changes: ${message}`, "error");
+			} catch {
+				/* no UI */
 			}
-		});
-		if (!report) return;
+			return;
+		}
+
 		if (report.failed) {
 			try {
 				ctx.ui.notify(`pi-overlayfs: failed to apply staged changes: ${report.failed.error}`, "error");
@@ -258,4 +294,3 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 }
-

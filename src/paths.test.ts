@@ -136,26 +136,6 @@ describe("paths: resolveToolPath heuristic", () => {
 	});
 });
 
-describe("paths: realToOverlayRelative (finisher drop mapping)", () => {
-	const overlays: OverlayEntry[] = [
-		{ mountPoint: "/home/user", root: WIN_HOME },
-		{ mountPoint: "/project", root: WIN_PROJECT_SEPARATE },
-	];
-	const mapper = winMapper(overlays, WIN_PROJECT_SEPARATE);
-
-	it("maps real paths back to overlay-relative POSIX paths", () => {
-		expect(mapper.realToOverlayRelative("D:\\sandwork\\app\\dist\\out.js")).toEqual({
-			overlayRoot: realpathSafe(WIN_PROJECT_SEPARATE),
-			overlayRelativePath: "/dist/out.js",
-		});
-		expect(mapper.realToOverlayRelative("c:\\sandhome\\jerry\\x")).toEqual({
-			overlayRoot: realpathSafe(WIN_HOME),
-			overlayRelativePath: "/x",
-		});
-		expect(mapper.realToOverlayRelative("E:\\nowhere")).toBeNull();
-	});
-});
-
 function realpathSafe(p: string): string {
 	try {
 		return realpathSync(p);

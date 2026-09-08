@@ -1,23 +1,32 @@
 /**
- * Post-turn finisher: at turn_end, apply staged overlay changes to disk.
+ * Post-turn finisher: at turn_end, apply the merged change set to disk.
  * Changes inside the project root are auto-approved; changes outside it
  * require confirmation (ctx.ui.confirm) or, headless, the
- * PI_OVERLAYFS_OUTSIDE_PROJECT=approve env var. Denied changes are dropped
- * from the overlay (never applied). Apply-or-drop: a failure during
- * confirm/apply discards the unapplied remainder and reports it — no staged
- * change survives across turns.
+ * PI_OVERLAYFS_OUTSIDE_PROJECT=approve env var. Denied changes are simply
+ * not applied (with the fork model there is no shared overlay to drop from).
+ * Apply failures are collected per entry and reported — the model must learn
+ * which changes did not persist.
  *
- * Dependencies are injected so the partition/apply/drop logic is testable
- * against a real sandbox on temp dirs without a pi runtime.
+ * Dependencies are injected so the partition/apply/report logic is testable
+ * against a real vfs template on temp dirs without a pi runtime.
  */
-import type { AgentSandbox, SandboxChangeSet, SandboxWrite } from "@jerryan/just-bash";
-import { hostPathsEqual, type PathMapper } from "./paths.js";
+import nodePath from "node:path";
+import { applyDiffToRealFs, type OverlayDiff, type OverlayWrite } from "@jerryan/just-bash";
+
+/** One entry that could not be applied to disk. */
+export interface ApplyFailure {
+	path: string;
+	error: string;
+}
 
 export interface FinisherDeps {
-	diff(): SandboxChangeSet;
-	applyChanges(subset: SandboxChangeSet): Promise<void>;
-	/** Drop pending staged entries by real host path (never applied). */
-	drop(realPaths: string[]): void;
+	/** The merged host-space change set for this turn. */
+	diff(): OverlayDiff;
+	/**
+	 * Apply a subset, entry by entry. Returns the entries that FAILED
+	 * (empty on full success) — failures are data, not exceptions.
+	 */
+	applyChanges(subset: OverlayDiff): Promise<ApplyFailure[]>;
 	isUnderProject(realPath: string): boolean;
 	/** True when the real path currently exists on disk as a directory. */
 	isExistingDirectory(realPath: string): boolean;
@@ -30,37 +39,38 @@ export interface FinisherDeps {
 export interface FinisherReport {
 	/** Entries applied to disk (inside-project auto-approved + approved outside). */
 	applied: number;
-	/** Outside-project paths DENIED by the user or the headless policy → dropped. */
+	/** Outside-project paths DENIED by the user or the headless policy → not applied. */
 	denied: string[];
 	/**
-	 * Approved but FAILED to apply (apply or confirm error) → dropped per the
-	 * apply-or-drop policy. paths excludes no-op directory scaffolding.
+	 * Approved but FAILED to apply (per-entry apply errors, or a confirm
+	 * error). paths names exactly what was lost.
 	 */
 	failed: { error: string; paths: string[] } | null;
 }
 
-function isNoOpDirectoryWrite(write: SandboxWrite, isExistingDirectory: (p: string) => boolean): boolean {
+function isNoOpDirectoryWrite(write: OverlayWrite, isExistingDirectory: (p: string) => boolean): boolean {
 	// The overlay stages the whole parent dir chain for every write. Directory
 	// entries whose target already exists on disk are mkdir -p no-ops — never
-	// bother the user with them; just drop them.
+	// bother the user with them; they are simply not applied.
 	return write.nodeType === "directory" && isExistingDirectory(write.path);
 }
 
-function emptyChangeSet(): SandboxChangeSet {
+function emptyDiff(): OverlayDiff {
 	return { writes: [], deletions: [] };
 }
 
 /**
  * Partition a change set into inside-project and outside-project subsets.
- * No-op directory writes in the outside set are split out for silent dropping.
+ * No-op directory writes in the outside set are split out (never applied,
+ * never prompted about).
  */
 export function partitionChanges(
-	changes: SandboxChangeSet,
+	changes: OverlayDiff,
 	isUnderProject: (p: string) => boolean,
 	isExistingDirectory: (p: string) => boolean,
-): { inside: SandboxChangeSet; outside: SandboxChangeSet; noOpDirs: string[] } {
-	const inside = emptyChangeSet();
-	const outside = emptyChangeSet();
+): { inside: OverlayDiff; outside: OverlayDiff; noOpDirs: string[] } {
+	const inside = emptyDiff();
+	const outside = emptyDiff();
 	const noOpDirs: string[] = [];
 
 	for (const write of changes.writes) {
@@ -79,107 +89,93 @@ export function partitionChanges(
 	return { inside, outside, noOpDirs };
 }
 
-function realPathsOf(changes: SandboxChangeSet): string[] {
+function realPathsOf(changes: OverlayDiff): string[] {
 	return [...changes.deletions, ...changes.writes.map((w) => w.path)];
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/** Host diffs join mount roots with "/" (browser-safe); normalize once up
+ * front so confirms, reports, and applies all see native separators. */
+function normalizeDiff(diff: OverlayDiff): OverlayDiff {
+	return {
+		writes: diff.writes.map((w) => ({ ...w, path: nodePath.normalize(w.path) })),
+		deletions: diff.deletions.map((d) => nodePath.normalize(d)),
+	};
+}
+
+/**
+ * Apply a change set entry by entry (deletions deepest-first, then writes),
+ * collecting per-entry failures instead of stopping at the first one — the
+ * apply-or-drop warning wants to name exactly what was lost. Paths are
+ * normalized first: host diffs join mount roots with "/" (browser-safe),
+ * which applyDiffToRealFs rejects on Windows.
+ */
+export async function applyChangeSetPerEntry(
+	subset: OverlayDiff,
+	apply: (diff: OverlayDiff) => void | Promise<void> = applyDiffToRealFs,
+): Promise<ApplyFailure[]> {
+	const failures: ApplyFailure[] = [];
+	const deletions = [...subset.deletions].sort((a, b) => b.length - a.length);
+	for (const target of deletions) {
+		try {
+			await apply({ writes: [], deletions: [nodePath.normalize(target)] });
+		} catch (error) {
+			failures.push({ path: target, error: errorMessage(error) });
+		}
+	}
+	for (const write of subset.writes) {
+		try {
+			await apply({ writes: [{ ...write, path: nodePath.normalize(write.path) }], deletions: [] });
+		} catch (error) {
+			failures.push({ path: write.path, error: errorMessage(error) });
+		}
+	}
+	return failures;
 }
 
 export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 	const report: FinisherReport = { applied: 0, denied: [], failed: null };
-	const changes = deps.diff();
+	const changes = normalizeDiff(deps.diff());
 	if (changes.writes.length === 0 && changes.deletions.length === 0) return report;
 
-	const { inside, outside, noOpDirs } = partitionChanges(
-		changes,
-		deps.isUnderProject,
-		deps.isExistingDirectory,
-	);
+	const { inside, outside } = partitionChanges(changes, deps.isUnderProject, deps.isExistingDirectory);
+	const failures: ApplyFailure[] = [];
 
-	if (noOpDirs.length > 0) {
-		deps.drop(noOpDirs);
+	if (inside.writes.length > 0 || inside.deletions.length > 0) {
+		const failed = await deps.applyChanges(inside);
+		failures.push(...failed);
+		report.applied += inside.writes.length + inside.deletions.length - failed.length;
 	}
 
-	try {
-		if (inside.writes.length > 0 || inside.deletions.length > 0) {
-			await deps.applyChanges(inside);
-			report.applied += inside.writes.length + inside.deletions.length;
-		}
-
-		if (outside.writes.length > 0 || outside.deletions.length > 0) {
-			const outsidePaths = realPathsOf(outside);
-			const approved = deps.confirm
+	if (outside.writes.length > 0 || outside.deletions.length > 0) {
+		const outsidePaths = realPathsOf(outside);
+		let approved = false;
+		let confirmError: unknown;
+		try {
+			approved = deps.confirm
 				? await deps.confirm(outsidePaths)
 				: deps.outsidePolicy()?.toLowerCase() === "approve";
+		} catch (error) {
+			confirmError = error;
+		}
 
-			if (approved) {
-				await deps.applyChanges(outside);
-				report.applied += outsidePaths.length;
-			} else {
-				deps.drop(outsidePaths);
-				report.denied = outsidePaths;
-			}
+		if (confirmError !== undefined) {
+			const message = errorMessage(confirmError);
+			failures.push(...outsidePaths.map((p) => ({ path: p, error: message })));
+		} else if (approved) {
+			const failed = await deps.applyChanges(outside);
+			failures.push(...failed);
+			report.applied += outsidePaths.length - failed.length;
+		} else {
+			report.denied = outsidePaths;
 		}
-	} catch (error) {
-		// Apply-or-drop: a failure never leaves pending residue across turns.
-		// (applyChanges drops the entries it already applied, so the remaining
-		// diff is exactly the unapplied remainder.) Drop it and report it —
-		// the model must learn its changes did not persist.
-		const remaining = deps.diff();
-		const remainingPaths = realPathsOf(remaining);
-		if (remainingPaths.length > 0) {
-			try {
-				deps.drop(remainingPaths);
-			} catch {
-				/* drop is best-effort */
-			}
-		}
-		report.failed = {
-			error: error instanceof Error ? error.message : String(error),
-			paths: [
-				...remaining.deletions,
-				...remaining.writes
-					.filter((w) => !isNoOpDirectoryWrite(w, deps.isExistingDirectory))
-					.map((w) => w.path),
-			],
-		};
+	}
+
+	if (failures.length > 0) {
+		report.failed = { error: failures[0]!.error, paths: failures.map((f) => f.path) };
 	}
 	return report;
-}
-
-/**
- * Drop pending staged entries by real host path, grouped per overlay so each
- * OverlayFs.drop() call gets its full list (drop handles nested paths
- * deepest-first; dropping one path per call would leave parent dir nodes
- * behind whenever their children are dropped afterwards).
- */
-export function dropStagedPaths(
-	sandbox: Pick<AgentSandbox, "overlays">,
-	mapper: Pick<PathMapper, "realToOverlayRelative">,
-	realPaths: string[],
-): void {
-	const byOverlay = new Map<string, { fs: { drop(paths: string[]): void }; relPaths: string[] }>();
-	for (const realPath of realPaths) {
-		const found = mapper.realToOverlayRelative(realPath);
-		if (!found) {
-			console.warn(`pi-overlayfs: cannot drop staged path (under no overlay root): ${realPath}`);
-			continue;
-		}
-		// Normalization-aware match: the mapper's (canonicalized) root spelling
-		// can diverge from the sandbox's (plain-realpath) root on casing — an
-		// exact === would silently skip the drop and the finisher would
-		// re-prompt forever.
-		const entry = [...sandbox.overlays.values()].find((o) => hostPathsEqual(o.root, found.overlayRoot));
-		if (!entry) {
-			console.warn(`pi-overlayfs: cannot drop staged path (no overlay for root ${found.overlayRoot}): ${realPath}`);
-			continue;
-		}
-		let group = byOverlay.get(found.overlayRoot);
-		if (!group) {
-			group = { fs: entry.fs, relPaths: [] };
-			byOverlay.set(found.overlayRoot, group);
-		}
-		group.relPaths.push(found.overlayRelativePath);
-	}
-	for (const group of byOverlay.values()) {
-		group.fs.drop(group.relPaths);
-	}
 }

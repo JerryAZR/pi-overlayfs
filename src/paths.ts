@@ -42,12 +42,6 @@ export interface PathMapper {
 	hostToVirtual(hostPath: string): HostMapping | null;	/** True when `realPath` is the project root or underneath it. */
 	isUnderProject(realPath: string): boolean;
 	/**
-	 * Map a real host path back to its overlay-relative POSIX path (leading
-	 * slash) plus the overlay root — the inverse of SandboxChangeSet paths.
-	 * Returns null when under no overlay root.
-	 */
-	realToOverlayRelative(realPath: string): { overlayRoot: string; overlayRelativePath: string } | null;
-	/**
 	 * Resolve an absolute path handed to a tool's filesystem operations to a
 	 * virtual vfs path. Heuristic (documented in README):
 	 *
@@ -95,11 +89,6 @@ function isWithin(root: string, child: string, platform: Platform): boolean {
 
 function isWindowsAbsolute(p: string): boolean {
 	return WINDOWS_ABSOLUTE.test(p) || UNC_PATH.test(p);
-}
-
-/** Normalization-aware host path equality (slash-normalized, case-insensitive on win32). */
-export function hostPathsEqual(a: string, b: string, platform: Platform = process.platform as Platform): boolean {
-	return compareForm(a, platform) === compareForm(b, platform);
 }
 
 /** Longest-overlay-root-prefix match for a host path. */
@@ -213,14 +202,6 @@ export function createPathMapper(options: {
 		// or already-canonical diff() paths — and get the same verdict.
 		isUnderProject: (realPath) =>
 			isWithin(projectRoot, canonicalize(realPath), platform) || isWithin(projectRoot, realPath, platform),
-		realToOverlayRelative: (realPath) => {
-			const canonical = canonicalize(realPath);
-			const canonicalMatch = matchOverlay(canonical, overlays, platform);
-			const entry = canonicalMatch ?? matchOverlay(realPath, overlays, platform);
-			if (!entry) return null;
-			const matchedPath = canonicalMatch ? canonical : realPath;
-			return { overlayRoot: entry.root, overlayRelativePath: relativeToRoot(entry.root, matchedPath, platform) };
-		},
 		resolveToolPath: (absolutePath) => {
 			// Rule 1: host mapping.
 			const mapped = hostToVirtual(absolutePath);
