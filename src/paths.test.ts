@@ -33,25 +33,20 @@ describe("paths: project-inside-home topology (single home overlay)", () => {
 	const mapper = winMapper(overlays, WIN_PROJECT);
 
 	it("maps the project root to its virtual subpath", () => {
-		const m = mapper.hostToVirtual(WIN_PROJECT);
-		expect(m).not.toBeNull();
-		expect(m!.virtualPath).toBe("/home/user/Projects/app");
-		expect(m!.mountPoint).toBe("/home/user");
-		expect(m!.overlayRoot).toBe(WIN_HOME);
-		expect(m!.overlayRelativePath).toBe("/Projects/app");
-		expect(m!.underProject).toBe(true);
+		expect(mapper.hostToVirtual(WIN_PROJECT)).toBe("/home/user/Projects/app");
+		expect(mapper.isUnderProject(WIN_PROJECT)).toBe(true);
 	});
 
 	it("maps nested files, accepting forward slashes and different casing", () => {
-		const m = mapper.hostToVirtual("c:/SANDHOME/jerry/projects/app/src/index.ts");
-		expect(m!.virtualPath).toBe("/home/user/projects/app/src/index.ts");
-		expect(m!.underProject).toBe(true);
+		expect(mapper.hostToVirtual("c:/SANDHOME/jerry/projects/app/src/index.ts")).toBe(
+			"/home/user/projects/app/src/index.ts",
+		);
 	});
 
 	it("marks home paths outside the project as not under project", () => {
 		const m = mapper.hostToVirtual("C:\\sandhome\\jerry\\Downloads\\x.txt");
-		expect(m!.virtualPath).toBe("/home/user/Downloads/x.txt");
-		expect(m!.underProject).toBe(false);
+		expect(m).toBe("/home/user/Downloads/x.txt");
+		expect(mapper.isUnderProject("C:\\sandhome\\jerry\\Downloads\\x.txt")).toBe(false);
 	});
 
 	it("returns null for paths under no overlay root", () => {
@@ -73,26 +68,20 @@ describe("paths: separate /project topology", () => {
 	const mapper = winMapper(overlays, WIN_PROJECT_SEPARATE);
 
 	it("maps the project onto the /project mount", () => {
-		const m = mapper.hostToVirtual("D:\\sandwork\\app\\src\\main.ts");
-		expect(m!.virtualPath).toBe("/project/src/main.ts");
-		expect(m!.mountPoint).toBe("/project");
-		expect(m!.overlayRelativePath).toBe("/src/main.ts");
-		expect(m!.underProject).toBe(true);
+		expect(mapper.hostToVirtual("D:\\sandwork\\app\\src\\main.ts")).toBe("/project/src/main.ts");
+		expect(mapper.isUnderProject("D:\\sandwork\\app\\src\\main.ts")).toBe(true);
 	});
 
 	it("maps the project root itself to the mount point", () => {
-		const m = mapper.hostToVirtual(WIN_PROJECT_SEPARATE);
-		expect(m!.virtualPath).toBe("/project");
-		expect(m!.overlayRelativePath).toBe("/");
+		expect(mapper.hostToVirtual(WIN_PROJECT_SEPARATE)).toBe("/project");
 	});
 });
 
 describe("paths: posix topology", () => {
 	it("maps identity-style under home and separate /project mounts", () => {
 		const inside = posixMapper([{ mountPoint: "/home/user", root: POSIX_HOME }], POSIX_PROJECT);
-		const m = inside.hostToVirtual("/home/jerry/projects/app/a.ts");
-		expect(m!.virtualPath).toBe("/home/user/projects/app/a.ts");
-		expect(m!.underProject).toBe(true);
+		expect(inside.hostToVirtual("/home/jerry/projects/app/a.ts")).toBe("/home/user/projects/app/a.ts");
+		expect(inside.isUnderProject("/home/jerry/projects/app/a.ts")).toBe(true);
 
 		const separate = posixMapper(
 			[
@@ -101,7 +90,7 @@ describe("paths: posix topology", () => {
 			],
 			POSIX_PROJECT_SEPARATE,
 		);
-		expect(separate.hostToVirtual("/opt/app/a.ts")!.virtualPath).toBe("/project/a.ts");
+		expect(separate.hostToVirtual("/opt/app/a.ts")).toBe("/project/a.ts");
 		// POSIX comparison is case-sensitive.
 		expect(separate.isUnderProject("/OPT/APP/a.ts")).toBe(false);
 	});
@@ -187,8 +176,8 @@ describe("paths: canonicalization (real fs)", () => {
 		const viaLink = mapper.hostToVirtual(path.join(link, "project", "src", "x.ts"));
 		const viaReal = mapper.hostToVirtual(path.join(home, "project", "src", "x.ts"));
 		expect(viaLink).not.toBeNull();
-		expect(viaLink!.virtualPath).toBe(viaReal!.virtualPath);
-		expect(viaLink!.underProject).toBe(true);
+		expect(viaLink).toBe(viaReal);
+		expect(mapper.isUnderProject(path.join(link, "project", "src", "x.ts"))).toBe(true);
 		// projectRoot through the symlink must classify canonical diff paths too.
 		expect(mapper.isUnderProject(path.join(realpathSync(home), "project", "y.ts"))).toBe(true);
 	});
@@ -204,9 +193,9 @@ describe("paths: canonicalization (real fs)", () => {
 		const proper = mapper.hostToVirtual(path.join(project, "MixedCase", "f.txt"));
 		const upper = mapper.hostToVirtual(path.join(project, "MIXEDCASE", "f.txt"));
 		const lower = mapper.hostToVirtual(path.join(project, "mixedcase", "f.txt"));
-		expect(proper!.virtualPath).toContain("MixedCase");
-		expect(upper!.virtualPath).toBe(proper!.virtualPath);
-		expect(lower!.virtualPath).toBe(proper!.virtualPath);
+		expect(proper).toContain("MixedCase");
+		expect(upper).toBe(proper);
+		expect(lower).toBe(proper);
 	});
 
 	it("canonicalizes the nearest existing ancestor for not-yet-created paths", () => {
@@ -222,8 +211,7 @@ describe("paths: canonicalization (real fs)", () => {
 			platform: "posix",
 			canonicalize: (p) => (p.startsWith("/tmp/") ? `/private${p}` : p),
 		});
-		const m = mapper.hostToVirtual("/tmp/home/project/src/x.ts");
-		expect(m!.virtualPath).toBe("/home/user/project/src/x.ts");
-		expect(m!.underProject).toBe(true);
+		expect(mapper.hostToVirtual("/tmp/home/project/src/x.ts")).toBe("/home/user/project/src/x.ts");
+		expect(mapper.isUnderProject("/tmp/home/project/src/x.ts")).toBe(true);
 	});
 });

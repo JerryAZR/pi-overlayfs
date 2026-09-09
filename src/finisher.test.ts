@@ -38,7 +38,7 @@ beforeEach(async () => {
 		overlays: [{ mountPoint: "/home/user", root: home }],
 		projectRoot: project,
 	});
-	virtualProject = mapper.hostToVirtual(project)!.virtualPath;
+	virtualProject = mapper.hostToVirtual(project)!;
 	stagedForks = [];
 });
 
@@ -101,7 +101,7 @@ describe("partitionChanges", () => {
 			],
 			deletions: [path.join(project, "gone.txt"), path.join(home, "outside-gone.txt")],
 		};
-		const { inside, outside, noOpDirs } = partitionChanges(
+		const { inside, outside } = partitionChanges(
 			changes,
 			(p) => mapper.isUnderProject(p),
 			(p) => existsSync(p),
@@ -110,8 +110,7 @@ describe("partitionChanges", () => {
 		expect(inside.deletions).toEqual([path.join(project, "gone.txt")]);
 		expect(outside.writes.map((w) => w.path)).toEqual([path.join(home, "b.txt")]);
 		expect(outside.deletions).toEqual([path.join(home, "outside-gone.txt")]);
-		// home exists on disk -> mkdir -p no-op -> never applied, never prompts.
-		expect(noOpDirs).toEqual([home]);
+		// home exists on disk -> mkdir -p no-op -> excluded from the outside set.
 	});
 });
 
@@ -119,13 +118,15 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 	it("auto-applies inside-project changes without any confirmation", async () => {
 		await stage("echo staged > staged.txt");
 		let confirmCalls = 0;
+		const diff = await mergedHostDiff();
 		const report = await runFinisher(
-			makeDeps(await mergedHostDiff(), { confirm: async () => (confirmCalls++, false) }),
+			makeDeps(diff, { confirm: async () => (confirmCalls++, false) }),
 		);
 
 		expect(readFileSync(path.join(project, "staged.txt"), "utf8")).toBe("staged\n");
 		expect(confirmCalls).toBe(0);
-		expect(report.applied).toBeGreaterThan(0);
+		// Exact accounting: every diff entry applied, none failed/denied.
+		expect(report.applied).toBe(diff.writes.length + diff.deletions.length);
 	});
 
 	it("does not prompt for pre-existing parent dir chain entries", async () => {
@@ -213,6 +214,29 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
 		expect(report.failed?.paths.some((p) => p.includes("outside.txt"))).toBe(true);
 		expect(report.denied).toEqual([]);
+	});
+
+	it("merge conflict: the later write wins deterministically", async () => {
+		await stage("echo first > conflict.txt");
+		// Distinct changedAt stamps (ms granularity), so ordering never falls
+		// back to the input-order tiebreak.
+		await new Promise((r) => setTimeout(r, 5));
+		await stage("echo second > conflict.txt");
+		const diff = await mergedHostDiff();
+
+		const report = await runFinisher(makeDeps(diff));
+		expect(report.failed).toBeNull();
+		expect(readFileSync(path.join(project, "conflict.txt"), "utf8")).toBe("second\n");
+	});
+
+	it("applies nested deletions deepest-first without spurious failures", async () => {
+		await mkdir(path.join(project, "sub"), { recursive: true });
+		await writeFile(path.join(project, "sub", "nested.txt"), "x\n");
+		await stage("rm -rf sub");
+
+		const report = await runFinisher(makeDeps(await mergedHostDiff()));
+		expect(report.failed).toBeNull();
+		expect(existsSync(path.join(project, "sub"))).toBe(false);
 	});
 
 	it("applies deletions inside the project", async () => {

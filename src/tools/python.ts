@@ -109,7 +109,6 @@ export function createPythonToolDefinition<F extends OverlayVfs>(deps: PythonToo
 			let scriptPath: string;
 			if (hasCode) {
 				scriptPath = `/tmp/.pi-py-${scriptCounter++}.py`;
-				await fork.mkdir(path.posix.dirname(scriptPath), { recursive: true });
 				await fork.writeFile(scriptPath, params.code as string, { encoding: "utf8" });
 			} else {
 				scriptPath = toVirtual(params.path as string, virtualCwd, deps.resolveAbsolute);

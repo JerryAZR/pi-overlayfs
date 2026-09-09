@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -58,7 +58,14 @@ afterEach(async () => {
 	await rm(tmpRoot, { recursive: true, force: true });
 });
 
-function fakeCtx(cwd: string, opts: { hasUI?: boolean; confirm?: () => Promise<boolean>; notifications?: string[] } = {}) {
+function fakeCtx(
+	cwd: string,
+	opts: {
+		hasUI?: boolean;
+		confirm?: (title: string, message: string) => Promise<boolean>;
+		notifications?: string[];
+	} = {},
+) {
 	return {
 		cwd,
 		hasUI: opts.hasUI ?? false,
@@ -72,6 +79,10 @@ function fakeCtx(cwd: string, opts: { hasUI?: boolean; confirm?: () => Promise<b
 async function startSession(fake: FakePi, cwd: string, ctx = fakeCtx(cwd)) {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- fake pi is intentionally partial
 	extension(fake.pi as any);
+	// Pin the event names the extension must register — a typo'd or renamed
+	// event would otherwise surface as a cryptic undefined-handler crash below.
+	expect(fake.handlers.has("session_start")).toBe(true);
+	expect(fake.handlers.has("turn_end")).toBe(true);
 	await fake.handlers.get("session_start")!({ type: "session_start", reason: "startup" }, ctx);
 	return ctx;
 }
@@ -143,7 +154,7 @@ describe("extension wiring (fake pi, real sandbox)", () => {
 		}
 	});
 
-	it("write tool stages via overlay; tool_result finisher auto-applies inside-project changes", async () => {
+	it("write tool stages via overlay; turn_end finisher auto-applies inside-project changes", async () => {
 		const notifications: string[] = [];
 		const fake = makeFakePi();
 		const ctx = await startSession(fake, project, fakeCtx(project, { notifications }));
@@ -158,20 +169,54 @@ describe("extension wiring (fake pi, real sandbox)", () => {
 		expect(readFileSync(target, "utf8")).toBe("hello\n");
 	});
 
-	it("finisher runs at turn_end: staged changes from the batch are applied", async () => {
+	it("bash sandboxed call registers its fork; turn_end applies it", async () => {
 		const fake = makeFakePi();
 		const ctx = await startSession(fake, project);
-		const write = toolByName(fake, "write");
+		const bash = toolByName(fake, "bash");
 
-		const target = path.join(project, "via-read.txt");
-		await write.execute("call-1", { path: target, content: "x\n" }, undefined, undefined);
+		const target = path.join(project, "bash-made.txt");
+		await bash.execute("call-1", { command: "echo hi > bash-made.txt" }, undefined, undefined);
 		expect(existsSync(target)).toBe(false);
 
 		await turnEnd(fake, ctx);
-		expect(readFileSync(target, "utf8")).toBe("x\n");
+		expect(readFileSync(target, "utf8")).toBe("hi\n");
 	});
 
-	it("finisher also runs on turns whose tool calls were aborted (toolResults empty)", async () => {
+	it("pins mid-turn isolation: a read before turn_end sees disk, after turn_end sees the applied write", async () => {
+		const fake = makeFakePi();
+		const ctx = await startSession(fake, project);
+		const write = toolByName(fake, "write");
+		const read = toolByName(fake, "read");
+		const target = path.join(project, "pinned.txt");
+
+		await write.execute("call-1", { path: target, content: "v1\n" }, undefined, undefined);
+		// Same turn: forks are isolated until the merge — the read still sees
+		// live disk, where the file does not exist yet.
+		await expect(read.execute("call-2", { path: target }, undefined, undefined)).rejects.toThrow(
+			/ENOENT|not found/i,
+		);
+		// After the barrier the write is applied and visible.
+		await turnEnd(fake, ctx);
+		const after = await read.execute("call-3", { path: target }, undefined, undefined);
+		expect(JSON.stringify(after)).toContain("v1");
+	});
+
+	it("a failed edit call never reaches the merge", async () => {
+		const fake = makeFakePi();
+		const ctx = await startSession(fake, project);
+		const target = path.join(project, "seed-edit.txt");
+		await writeFile(target, "hello\n");
+		const edit = toolByName(fake, "edit");
+
+		await expect(
+			edit.execute("call-1", { path: target, oldText: "NOT PRESENT", newText: "x" }, undefined, undefined),
+		).rejects.toThrow();
+		await turnEnd(fake, ctx);
+		expect(readFileSync(target, "utf8")).toBe("hello\n");
+		expect(fake.messages).toHaveLength(0);
+	});
+
+	it("turn_end applies completed calls' changes even when the turn ended abnormally", async () => {
 		const fake = makeFakePi();
 		const ctx = await startSession(fake, project);
 		const write = toolByName(fake, "write");
@@ -281,13 +326,13 @@ describe("extension wiring (fake pi, real sandbox)", () => {
 		expect(readFileSync(outside, "utf8")).toBe("yes\n");
 	});
 
-	it("with UI, the confirm dialog lists outside paths and approval applies them", async () => {
-		const asked: string[][] = [];
+	it("with UI, the confirm dialog receives the outside paths and approval applies them", async () => {
+		const asked: { title: string; message: string }[] = [];
 		const fake = makeFakePi();
 		const ctx = fakeCtx(project, {
 			hasUI: true,
-			confirm: async () => {
-				asked.push([]);
+			confirm: async (title, message) => {
+				asked.push({ title, message });
 				return true;
 			},
 		});
@@ -298,6 +343,47 @@ describe("extension wiring (fake pi, real sandbox)", () => {
 		await write.execute("call-1", { path: outside, content: "y\n" }, undefined, undefined);
 		await turnEnd(fake, ctx);
 		expect(asked).toHaveLength(1);
+		// Loose on presentation (that's a UI choice), strict on content: the
+		// outside path must reach the dialog.
+		expect(asked[0]!.message).toContain("asked.txt");
 		expect(readFileSync(outside, "utf8")).toBe("y\n");
+	});
+});
+
+describe("project-outside-home topology (two mounts: /home/user + /project)", () => {
+	it("project writes auto-apply; home writes prompt; notify lists both mounts", async () => {
+		const standalone = path.join(tmpRoot, "standalone");
+		await mkdir(standalone);
+		const notifications: string[] = [];
+		const asked: string[] = [];
+		const fake = makeFakePi();
+		const ctx = fakeCtx(standalone, {
+			hasUI: true,
+			notifications,
+			confirm: async (_title, message) => {
+				asked.push(message);
+				return false;
+			},
+		});
+		await startSession(fake, standalone, ctx);
+
+		// Both mounts announced at session start.
+		expect(notifications.some((n) => n.includes("/home/user") && n.includes("/project"))).toBe(true);
+
+		const write = toolByName(fake, "write");
+		// Inside the project → auto-approved, no dialog.
+		const insideFile = path.join(standalone, "in.txt");
+		await write.execute("c1", { path: insideFile, content: "x\n" }, undefined, undefined);
+		await turnEnd(fake, ctx);
+		expect(readFileSync(insideFile, "utf8")).toBe("x\n");
+		expect(asked).toHaveLength(0);
+
+		// Into home (outside project) → dialog; denied here.
+		const homeFile = path.join(home, "out.txt");
+		await write.execute("c2", { path: homeFile, content: "y\n" }, undefined, undefined);
+		await turnEnd(fake, ctx);
+		expect(asked).toHaveLength(1);
+		expect(asked[0]).toContain("out.txt");
+		expect(existsSync(homeFile)).toBe(false);
 	});
 });

@@ -7,7 +7,6 @@ import type { BashOperations } from "@earendil-works/pi-coding-agent";
 
 /** Which route a command ended up taking (returned for observability/tests). */
 export type ExecRoute =
-	| "native-unmappable-cwd"
 	| "native-unparseable"
 	| "native-unresolved-static"
 	| "sandboxed"
@@ -35,13 +34,23 @@ export interface SandboxRunResult {
  */
 const SENSITIVE_COMMANDS = new Set(["rm", "mv", "rmdir"]);
 
+/** The mixed-call rejection error, shared by the static and runtime paths. */
+function mixedSensitiveError(sensitive: string[], unresolved: string[]): Error {
+	return new Error(
+		`Rejected: this call combines ${sensitive.join(", ")} with host-run commands (${unresolved.join(", ")}). ` +
+			`Rule: rm, mv and rmdir always run in the sandbox, so they cannot share a bash call with commands that run ` +
+			`natively on the host. Split the call: ${sensitive.join(", ")} must run on its own, in a separate bash call from the rest.`,
+	);
+}
+
 export interface BashExecDeps {
 	/** Static pre-flight analysis of the command (Bash.analyzeCommands). */
 	analyze(command: string): Promise<{ commands: string[]; unresolved: string[] }>;
 	/**
 	 * Execute in the overlay sandbox. Must already enforce timeout/abort.
 	 * Output is returned buffered — it is NOT streamed, so an aborted run
-	 * that falls back to native never double-prints (see H2 in README).
+	 * that falls back to native never double-prints (the aborted attempt's
+	 * output is discarded; only the native rerun's is emitted).
 	 */
 	execSandboxed(command: string, virtualCwd: string): Promise<SandboxRunResult>;
 	/** Execute natively on the host (pi's local shell operations). Streams itself. */
@@ -52,32 +61,31 @@ export interface BashExecRequest {
 	command: string;
 	/** Host cwd handed to the tool by pi. */
 	hostCwd: string;
-	/** Virtual cwd mapped from hostCwd, or null when the cwd is under no overlay root. */
-	virtualCwd: string | null;
+	/**
+	 * Virtual cwd mapped from hostCwd. Callers short-circuit the unmappable
+	 * case (null) to native before calling — see createOverlayBashOperations.
+	 */
+	virtualCwd: string;
 	/** Streamed output sink (pi's BashOperations onData). */
 	onData(data: Buffer): void;
 }
 
 /**
- * Decision flow:
- *  1. cwd not mappable into the sandbox          -> native passthrough.
- *  2. static analysis finds unresolved commands   -> native passthrough (no asking).
- *  3. sandboxed execution; output emitted only now (buffered until the route
+ * Decision flow (unmappable cwd is short-circuited by the caller):
+ *  1. static analysis finds unresolved commands   -> native passthrough (no asking).
+ *  2. sandboxed execution; output emitted only now (buffered until the route
  *     is decided, so fallbacks never duplicate output).
- *  4. runtime unresolved commands (fail-fast abort surfaced in the result)
+ *  3. runtime unresolved commands (fail-fast abort surfaced in the result)
  *     -> rerun natively. The aborted run's fork is simply never registered
  *     (see createOverlayBashOperations), so its partial writes never reach
- *     the merge — that is the whole H1 discard, by topology.
+ *     the merge.
+ * rm/mv/rmdir mixed with host-only commands is rejected on BOTH unresolved
+ * paths (1 and 3) — a deletion must never ride a native rerun past the gate.
  */
 export async function execBashWithFallback(
 	request: BashExecRequest,
 	deps: BashExecDeps,
 ): Promise<ExecOutcome> {
-	if (request.virtualCwd === null) {
-		const result = await deps.execNative(request.command, request.hostCwd);
-		return { exitCode: result.exitCode, route: "native-unmappable-cwd" };
-	}
-
 	// If static analysis cannot even parse the command (e.g. Windows
 	// cmd-style syntax: %VAR%, backslash quoting, 2>nul), we cannot know what
 	// it would do — degrade to native like any other unroutable command
@@ -89,17 +97,17 @@ export async function execBashWithFallback(
 		const result = await deps.execNative(request.command, request.hostCwd);
 		return { exitCode: result.exitCode, route: "native-unparseable" };
 	}
+	// The deletion gate holds on BOTH unresolved paths: statically known
+	// host-only commands, and commands composed at runtime (e.g. by command
+	// substitution) that only surface as unresolved mid-run. A native rerun
+	// must never carry rm/mv/rmdir past the overlay and the finisher's gate.
+	const sensitive = analysis.commands.filter((name) => SENSITIVE_COMMANDS.has(name));
 	if (analysis.unresolved.length > 0) {
-		const sensitive = analysis.commands.filter((name) => SENSITIVE_COMMANDS.has(name));
 		if (sensitive.length > 0) {
 			// Run NOTHING. A native route would let the deletion bypass the
 			// overlay (and its outside-project gate); a sandboxed route cannot
 			// run the host-only parts. The model must split the call.
-			throw new Error(
-				`Rejected: this call combines ${sensitive.join(", ")} with host-run commands (${analysis.unresolved.join(", ")}). ` +
-					`Rule: rm, mv and rmdir always run in the sandbox, so they cannot share a bash call with commands that run ` +
-					`natively on the host. Split the call: ${sensitive.join(", ")} must run on its own, in a separate bash call from the rest.`,
-			);
+			throw mixedSensitiveError(sensitive, analysis.unresolved);
 		}
 		const result = await deps.execNative(request.command, request.hostCwd);
 		return { exitCode: result.exitCode, route: "native-unresolved-static" };
@@ -107,6 +115,11 @@ export async function execBashWithFallback(
 
 	const sandboxed = await deps.execSandboxed(request.command, request.virtualCwd);
 	if (sandboxed.unresolvedCommands && sandboxed.unresolvedCommands.length > 0) {
+		if (sensitive.length > 0) {
+			// The aborted run's prefix already executed — inside its private
+			// fork, which the caller simply never registers (never reaches disk).
+			throw mixedSensitiveError(sensitive, sandboxed.unresolvedCommands);
+		}
 		const result = await deps.execNative(request.command, request.hostCwd);
 		return { exitCode: result.exitCode, route: "native-unresolved-runtime" };
 	}

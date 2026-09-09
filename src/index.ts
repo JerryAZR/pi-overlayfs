@@ -10,8 +10,10 @@
  * change set, which a finisher applies to disk: auto-approved inside the
  * project root, user-confirmed (ctx.ui.confirm) outside it. Headless (no
  * UI), outside-project changes are dropped unless
- * PI_OVERLAYFS_OUTSIDE_PROJECT=approve. Aborted/failed calls simply never
- * register their fork, so their partial writes never reach the merge.
+ * PI_OVERLAYFS_OUTSIDE_PROJECT=approve. Calls that ABORT, time out, or fall
+ * back to native never register their fork, so their partial writes never
+ * reach the merge; completed calls register regardless of exit code (effects
+ * before a failure are legitimate).
  */
 import { existsSync, statSync } from "node:fs";
 import os from "node:os";
@@ -30,6 +32,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Bash, createVfsTemplate, type MountableFs, type VfsTemplate } from "@jerryan/just-bash";
 import { createOverlayBashOperations, DEFAULT_TIMEOUT_SECONDS } from "./exec.js";
+import { applyChangeSetPerEntry, runFinisher } from "./finisher.js";
+import { canonicalizeHostPathFs, createPathMapper, type PathMapper } from "./paths.js";
+import { createOverlayEditOps, createOverlayReadOps, createOverlayWriteOps } from "./tools/file-ops.js";
+import { createPythonToolDefinition } from "./tools/python.js";
 
 /**
  * Proactive form of the mixed-call rule enforced in exec.ts: the model should
@@ -42,10 +48,6 @@ const BASH_SPLIT_GUIDELINE =
 	"(git, npm, cargo, node, python, ...) natively on the host. Never combine rm, mv or rmdir with host-run " +
 	"dev tools in a single call - the deletion must be its own separate bash call. Combining rm/mv with " +
 	"other file commands in one call is fine.";
-import { applyChangeSetPerEntry, runFinisher } from "./finisher.js";
-import { canonicalizeHostPathFs, createPathMapper, type PathMapper } from "./paths.js";
-import { createOverlayEditOps, createOverlayReadOps, createOverlayWriteOps } from "./tools/file-ops.js";
-import { createPythonToolDefinition } from "./tools/python.js";
 
 interface SessionState {
 	template: VfsTemplate;
@@ -81,11 +83,11 @@ export default function (pi: ExtensionAPI) {
 			overlays: mounts.map((m) => ({ mountPoint: m.at, root: m.root })),
 			projectRoot: cwd,
 		});
-		const virtualCwd = mapper.hostToVirtual(cwd)?.virtualPath ?? "/";
+		const virtualCwd = mapper.hostToVirtual(cwd) ?? "/";
 		const active: SessionState = { template, mapper, virtualCwd, turnForks: [] };
 		state = active;
 
-		const resolve = (absolutePath: string) => mapper.resolveToolPath(absolutePath);
+		const resolve = mapper.resolveToolPath;
 		const localBashOps = createLocalBashOperations();
 		const registerFork = (fork: MountableFs) => {
 			active.turnForks.push(fork);
@@ -107,7 +109,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			},
 			registerFork,
-			mapCwd: (hostCwd) => mapper.hostToVirtual(hostCwd)?.virtualPath ?? null,
+			mapCwd: (hostCwd) => mapper.hostToVirtual(hostCwd),
 			localOps: localBashOps,
 		});
 		const bashDef = createBashToolDefinition(cwd, { operations: bashOps });
@@ -136,38 +138,38 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					onUpdate,
 				),
-		});
+			});
+
+		// write/edit share one shape: fresh fork → execute → register on
+		// completion (pi's tools throw on failure, so registration is
+		// success-gated; a failed call's fork — and any partial write — is
+		// simply never registered).
+		const forkedFileToolExecute = <T extends { execute: (...args: never[]) => Promise<unknown> }>(
+			makeTool: (fork: MountableFs) => T,
+		): T["execute"] => {
+			const wrapped = (async (...args: unknown[]) => {
+				const fork = template.fork();
+				const result = await makeTool(fork).execute(...(args as never[]));
+				registerFork(fork);
+				return result;
+			}) as T["execute"];
+			return wrapped;
+		};
 
 		const writeDef = createWriteToolDefinition(cwd);
 		pi.registerTool({
 			...writeDef,
-			execute: async (id, params, signal, onUpdate) => {
-				const fork = template.fork();
-				const result = await createWriteTool(cwd, { operations: createOverlayWriteOps(fork, resolve) }).execute(
-					id,
-					params,
-					signal,
-					onUpdate,
-				);
-				registerFork(fork);
-				return result;
-			},
+			execute: forkedFileToolExecute(
+				(fork) => createWriteTool(cwd, { operations: createOverlayWriteOps(fork, resolve) }),
+			),
 		});
 
 		const editDef = createEditToolDefinition(cwd);
 		pi.registerTool({
 			...editDef,
-			execute: async (id, params, signal, onUpdate) => {
-				const fork = template.fork();
-				const result = await createEditTool(cwd, { operations: createOverlayEditOps(fork, resolve) }).execute(
-					id,
-					params,
-					signal,
-					onUpdate,
-				);
-				registerFork(fork);
-				return result;
-			},
+			execute: forkedFileToolExecute(
+				(fork) => createEditTool(cwd, { operations: createOverlayEditOps(fork, resolve) }),
+			),
 		});
 
 		pi.registerTool(
@@ -207,16 +209,8 @@ export default function (pi: ExtensionAPI) {
 		const forks = active.turnForks;
 		active.turnForks = [];
 
-		let hostDiff;
-		try {
-			const merged = await active.template.merge(forks);
-			hostDiff = merged.diff({ space: "host" });
-		} catch (error) {
-			console.error(`pi-overlayfs: merge failed: ${error instanceof Error ? error.message : error}`);
-			return;
-		}
-		if (hostDiff.writes.length === 0 && hostDiff.deletions.length === 0) return;
-
+		const merged = await active.template.merge(forks);
+		const hostDiff = merged.diff({ space: "host" });
 		let report;
 		try {
 			report = await runFinisher({

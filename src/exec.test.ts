@@ -34,7 +34,7 @@ beforeEach(async () => {
 		overlays: [{ mountPoint: "/home/user", root: home }],
 		projectRoot: project,
 	});
-	virtualProject = mapper.hostToVirtual(project)!.virtualPath;
+	virtualProject = mapper.hostToVirtual(project)!;
 });
 
 afterEach(async () => {
@@ -175,6 +175,26 @@ describe("execBashWithFallback (real vfs template on temp dirs)", () => {
 		expect(nativeCalls).toEqual([]);
 	});
 
+	it("rejects rm mixed with a runtime-only unresolved command — no native rerun", async () => {
+		const nativeCalls: string[] = [];
+		const { deps } = realDeps(nativeCalls);
+		await writeFile(path.join(project, "scratch.txt"), "x");
+		// someunknowncmd is produced by a command substitution: static analysis
+		// sees only [rm, echo] (both resolvable); the unresolved name appears
+		// only at runtime. The mixed-call gate must hold on the runtime
+		// fallback too — otherwise the rm executes natively, ungated.
+		const command = "rm scratch.txt && $(echo someunknowncmd)";
+
+		await expect(
+			execBashWithFallback(
+				{ command, hostCwd: project, virtualCwd: virtualProject, onData: noOp },
+				deps,
+			),
+		).rejects.toThrow(/rm[^]*separate|separate[^]*rm/i);
+		expect(nativeCalls).toEqual([]);
+		expect(existsSync(path.join(project, "scratch.txt"))).toBe(true);
+	});
+
 	it("does not reject rm as a non-command token (git rm, echo rm)", async () => {
 		for (const command of ["git rm --cached scratch.txt", "echo rm -rf / && cargo build"]) {
 			const nativeCalls: string[] = [];
@@ -216,17 +236,26 @@ describe("execBashWithFallback (real vfs template on temp dirs)", () => {
 		expect(fork.diff({ space: "vfs" }).deletions).toHaveLength(1);
 	});
 
-	it("falls back to native when the cwd maps to no overlay", async () => {
-		const nativeCalls: string[] = [];
-		const { deps } = realDeps(nativeCalls);
-
-		const outcome = await execBashWithFallback(
-			{ command: "echo hi", hostCwd: tmpRoot, virtualCwd: null, onData: noOp },
-			deps,
-		);
-
-		expect(outcome.route).toBe("native-unmappable-cwd");
-		expect(nativeCalls).toEqual(["echo hi"]);
+	it("falls back to native when the cwd maps to no overlay (ops-level short-circuit)", async () => {
+		const calls: string[] = [];
+		const localOps: BashOperations = {
+			exec: async (cmd) => {
+				calls.push(cmd);
+				return { exitCode: 0 };
+			},
+		};
+		const ops = createOverlayBashOperations({
+			forkBash: () => {
+				throw new Error("must not fork for the native route");
+			},
+			registerFork: () => {
+				throw new Error("must not register");
+			},
+			mapCwd: () => null,
+			localOps,
+		});
+		await ops.exec("echo hi", tmpRoot, { onData: noOp });
+		expect(calls).toEqual(["echo hi"]);
 	});
 
 	it("reruns natively when the sandboxed run reports runtime unresolved commands", async () => {
@@ -282,7 +311,7 @@ describe("runtime fallback safety (real vfs template)", () => {
 		return createOverlayBashOperations({
 			forkBash,
 			registerFork: (fork) => registered.push(fork),
-			mapCwd: (hostCwd) => mapper.hostToVirtual(hostCwd)?.virtualPath ?? null,
+			mapCwd: (hostCwd) => mapper.hostToVirtual(hostCwd),
 			localOps,
 		});
 	}
@@ -480,6 +509,19 @@ describe("default timeout (createOverlayBashOperations)", () => {
 			defaultTimeoutSeconds: 0.05,
 		});
 		await expect(ops.exec("hang", project, { onData: noOp })).rejects.toThrow("timeout:0.05");
+	});
+
+	it("abort/timeout never registers the fork", async () => {
+		const registered: unknown[] = [];
+		const ops = createOverlayBashOperations({
+			forkBash: nullForkBash,
+			registerFork: (f) => registered.push(f),
+			mapCwd: () => "/home/user/project",
+			localOps: spyLocalOps([]),
+			defaultTimeoutSeconds: 0.05,
+		});
+		await expect(ops.exec("hang", project, { onData: noOp })).rejects.toThrow("timeout:0.05");
+		expect(registered).toHaveLength(0);
 	});
 
 	it("an explicit timeout overrides the default", async () => {

@@ -1,7 +1,7 @@
 /**
  * Bidirectional host <-> virtual path mapping for the overlay sandbox.
  *
- * The sandbox (see @jerryan/just-bash createAgentSandbox) mounts copy-on-write
+ * The template (see @jerryan/just-bash createVfsTemplate) mounts copy-on-write
  * overlays at virtual POSIX mount points:
  *   - home overlay    -> virtual "/home/user"  (root = real home dir)
  *   - project overlay -> virtual "/project"    (only when the project is NOT
@@ -24,22 +24,10 @@ export interface OverlayEntry {
 	root: string;
 }
 
-export interface HostMapping {
-	/** Virtual POSIX path inside the sandbox vfs. */
-	virtualPath: string;
-	/** Virtual mount point of the overlay that shadows this path. */
-	mountPoint: string;
-	/** Real host root of that overlay. */
-	overlayRoot: string;
-	/** Overlay-root-relative POSIX path with a leading slash (as OverlayFs.diff/drop use). */
-	overlayRelativePath: string;
-	/** True when the real host path is the project root or underneath it. */
-	underProject: boolean;
-}
-
 export interface PathMapper {
-	/** Absolute host path -> overlay mapping, or null when under no overlay root. */
-	hostToVirtual(hostPath: string): HostMapping | null;	/** True when `realPath` is the project root or underneath it. */
+	/** Absolute host path -> virtual vfs path, or null when under no overlay root. */
+	hostToVirtual(hostPath: string): string | null;
+	/** True when `realPath` is the project root or underneath it. */
 	isUnderProject(realPath: string): boolean;
 	/**
 	 * Resolve an absolute path handed to a tool's filesystem operations to a
@@ -172,7 +160,7 @@ export function createPathMapper(options: {
 	const overlays = options.overlays.map((entry) => ({ ...entry, root: canonicalize(entry.root) }));
 	const projectRoot = canonicalize(options.projectRoot);
 
-	const hostToVirtual = (hostPath: string): HostMapping | null => {
+	const hostToVirtual = (hostPath: string): string | null => {
 		// Canonicalize first so symlinked cwd prefixes and off-casing inputs
 		// map onto the same virtual paths as their on-disk spellings (the vfs
 		// is case-sensitive even when the disk is not).
@@ -182,17 +170,9 @@ export function createPathMapper(options: {
 		if (!entry) return null;
 		const matchedPath = canonicalMatch ? canonical : hostPath;
 		const overlayRelativePath = relativeToRoot(entry.root, matchedPath, platform);
-		const virtualPath =
-			overlayRelativePath === "/"
-				? entry.mountPoint
-				: path.posix.join(entry.mountPoint, overlayRelativePath);
-		return {
-			virtualPath,
-			mountPoint: entry.mountPoint,
-			overlayRoot: entry.root,
-			overlayRelativePath,
-			underProject: isWithin(projectRoot, matchedPath, platform),
-		};
+		return overlayRelativePath === "/"
+			? entry.mountPoint
+			: path.posix.join(entry.mountPoint, overlayRelativePath);
 	};
 
 	return {
@@ -205,7 +185,7 @@ export function createPathMapper(options: {
 		resolveToolPath: (absolutePath) => {
 			// Rule 1: host mapping.
 			const mapped = hostToVirtual(absolutePath);
-			if (mapped) return mapped.virtualPath;
+			if (mapped) return mapped;
 			// Rule 2: already-virtual POSIX passthrough.
 			if (absolutePath.startsWith("/") && !isWindowsAbsolute(absolutePath)) {
 				return absolutePath;

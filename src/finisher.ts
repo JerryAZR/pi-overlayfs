@@ -61,24 +61,22 @@ function emptyDiff(): OverlayDiff {
 
 /**
  * Partition a change set into inside-project and outside-project subsets.
- * No-op directory writes in the outside set are split out (never applied,
- * never prompted about).
+ * No-op directory writes (the staged parent chain of dirs that already
+ * exist on disk) are silently excluded from the outside set — never
+ * applied, never prompted about.
  */
 export function partitionChanges(
 	changes: OverlayDiff,
 	isUnderProject: (p: string) => boolean,
 	isExistingDirectory: (p: string) => boolean,
-): { inside: OverlayDiff; outside: OverlayDiff; noOpDirs: string[] } {
+): { inside: OverlayDiff; outside: OverlayDiff } {
 	const inside = emptyDiff();
 	const outside = emptyDiff();
-	const noOpDirs: string[] = [];
 
 	for (const write of changes.writes) {
 		if (isUnderProject(write.path)) {
 			inside.writes.push(write);
-		} else if (isNoOpDirectoryWrite(write, isExistingDirectory)) {
-			noOpDirs.push(write.path);
-		} else {
+		} else if (!isNoOpDirectoryWrite(write, isExistingDirectory)) {
 			outside.writes.push(write);
 		}
 	}
@@ -86,7 +84,7 @@ export function partitionChanges(
 		if (isUnderProject(deletion)) inside.deletions.push(deletion);
 		else outside.deletions.push(deletion);
 	}
-	return { inside, outside, noOpDirs };
+	return { inside, outside };
 }
 
 function realPathsOf(changes: OverlayDiff): string[] {

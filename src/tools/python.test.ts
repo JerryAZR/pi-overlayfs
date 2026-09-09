@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
@@ -28,7 +28,7 @@ beforeEach(async () => {
 		overlays: [{ mountPoint: "/home/user", root: home }],
 		projectRoot: project,
 	});
-	virtualCwd = mapper.hostToVirtual(project)!.virtualPath;
+	virtualCwd = mapper.hostToVirtual(project)!;
 });
 
 afterEach(async () => {
@@ -70,7 +70,7 @@ describe("file-ops adapters (fresh fork per call)", () => {
 		await editOps.writeFile(path.join(project, "hello.txt"), before.toString().replace("hello", "goodbye"));
 		expect((await editOps.readFile(path.join(project, "hello.txt"))).toString()).toBe("goodbye\n");
 		// Staged only: disk still has the original until merge+apply.
-		expect(existsSync(path.join(project, "hello.txt"))).toBe(true);
+		expect(readFileSync(path.join(project, "hello.txt"), "utf8")).toBe("hello\n");
 		expect(fork.diff({ space: "vfs" }).writes.map((w) => path.posix.basename(w.path))).toContain("hello.txt");
 	});
 });
@@ -142,7 +142,7 @@ describe("python tool (real sandboxed CPython)", () => {
 		expect(existsSync(path.join(project, "made-by-python.txt"))).toBe(true);
 	});
 
-	it("a failed call does not register its fork", async () => {
+	it("a non-zero exit still registers the fork: effects before failure are legitimate", async () => {
 		const { tool, registered } = makeTool();
 		const result = await tool.execute("id", { code: "raise SystemExit(3)" }, undefined, undefined);
 		expect(result.content[0]!.text).toMatch(/\(exit 3\)$/);
@@ -169,6 +169,60 @@ describe("python tool (real sandboxed CPython)", () => {
 		await expect(tool.execute("id", { path: "nope.py" }, undefined, undefined)).rejects.toThrow(
 			"script not found",
 		);
+		expect(registered).toHaveLength(0);
+	});
+});
+
+describe("python tool params.cwd + abort", () => {
+	it("honors params.cwd (host path and virtual POSIX)", async () => {
+		const seenCwd: (string | undefined)[] = [];
+		const spyBash: PythonBash = {
+			exec: async (_cmd, opts) => {
+				seenCwd.push(opts?.cwd);
+				return { stdout: "", stderr: "", exitCode: 0, env: {} };
+			},
+		};
+		const tool = createPythonToolDefinition({
+			forkBash: () => ({ bash: spyBash, fork: template.fork() }),
+			registerFork: () => {},
+			resolveAbsolute: resolve,
+			virtualCwd,
+		});
+		await tool.execute("id", { code: "pass", cwd: project }, undefined, undefined);
+		expect(seenCwd[0]).toBe(virtualCwd);
+		await tool.execute("id", { code: "pass", cwd: "/tmp" }, undefined, undefined);
+		expect(seenCwd[1]).toBe("/tmp");
+	});
+
+	it("aborted python call rejects and does not register its fork", async () => {
+		const registered: MountableFs[] = [];
+		let execEntered!: () => void;
+		const entered = new Promise<void>((r) => {
+			execEntered = r;
+		});
+		const hangingBash: PythonBash = {
+			exec: (_cmd, opts) => {
+				execEntered();
+				return new Promise((resolve) => {
+					opts?.signal?.addEventListener("abort", () =>
+						resolve({ stdout: "", stderr: "", exitCode: 1, env: {} }),
+					);
+				});
+			},
+		};
+		const tool = createPythonToolDefinition({
+			forkBash: () => ({ bash: hangingBash, fork: template.fork() }),
+			registerFork: (f) => registered.push(f),
+			resolveAbsolute: resolve,
+			virtualCwd,
+		});
+		const controller = new AbortController();
+		const pending = tool.execute("id", { code: "pass" }, controller.signal, undefined);
+		// Abort only once the exec is in flight (its abort listener attached) —
+		// deterministic, no timing race with the /tmp staging steps.
+		await entered;
+		controller.abort();
+		await expect(pending).rejects.toThrow("aborted");
 		expect(registered).toHaveLength(0);
 	});
 });
