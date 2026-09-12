@@ -53,8 +53,13 @@ export interface BashExecDeps {
 	 * output is discarded; only the native rerun's is emitted).
 	 */
 	execSandboxed(command: string, virtualCwd: string): Promise<SandboxRunResult>;
-	/** Execute natively on the host (pi's local shell operations). Streams itself. */
-	execNative(command: string, hostCwd: string): Promise<{ exitCode: number | null }>;
+	/**
+	 * Execute natively on the host (pi's local shell operations). Streams itself.
+	 * Absent in fail-closed (read-only) configurations: no native route exists,
+	 * so unresolved commands run sandboxed and 127 bash-style in-band, and
+	 * unparseable commands surface as tool errors.
+	 */
+	execNative?(command: string, hostCwd: string): Promise<{ exitCode: number | null }>;
 }
 
 export interface BashExecRequest {
@@ -81,6 +86,12 @@ export interface BashExecRequest {
  *     the merge.
  * rm/mv/rmdir mixed with host-only commands is rejected on BOTH unresolved
  * paths (1 and 3) — a deletion must never ride a native rerun past the gate.
+ *
+ * Fail-closed variant (deps.execNative absent — read-only agents): every
+ * command runs sandboxed; unresolved commands 127 bash-style in-band
+ * (just-bash default with abortOnUnresolvedCommands off), unparseable
+ * commands throw a tool error. The deletion gate is unreachable — correctly:
+ * it exists to keep deletions off native reruns, and there are none.
  */
 export async function execBashWithFallback(
 	request: BashExecRequest,
@@ -93,7 +104,14 @@ export async function execBashWithFallback(
 	let analysis: { commands: string[]; unresolved: string[] };
 	try {
 		analysis = await deps.analyze(request.command);
-	} catch {
+	} catch (error) {
+		if (!deps.execNative) {
+			// Fail-closed: no native route to degrade to — surface the parse
+			// failure so the model can rewrite the command.
+			throw new Error(
+				`Command could not be parsed by the sandboxed shell: ${error instanceof Error ? error.message : error}`,
+			);
+		}
 		const result = await deps.execNative(request.command, request.hostCwd);
 		return { exitCode: result.exitCode, route: "native-unparseable" };
 	}
@@ -102,7 +120,7 @@ export async function execBashWithFallback(
 	// substitution) that only surface as unresolved mid-run. A native rerun
 	// must never carry rm/mv/rmdir past the overlay and the finisher's gate.
 	const sensitive = analysis.commands.filter((name) => SENSITIVE_COMMANDS.has(name));
-	if (analysis.unresolved.length > 0) {
+	if (analysis.unresolved.length > 0 && deps.execNative) {
 		if (sensitive.length > 0) {
 			// Run NOTHING. A native route would let the deletion bypass the
 			// overlay (and its outside-project gate); a sandboxed route cannot
@@ -114,7 +132,7 @@ export async function execBashWithFallback(
 	}
 
 	const sandboxed = await deps.execSandboxed(request.command, request.virtualCwd);
-	if (sandboxed.unresolvedCommands && sandboxed.unresolvedCommands.length > 0) {
+	if (sandboxed.unresolvedCommands && sandboxed.unresolvedCommands.length > 0 && deps.execNative) {
 		if (sensitive.length > 0) {
 			// The aborted run's prefix already executed — inside its private
 			// fork, which the caller simply never registers (never reaches disk).
@@ -252,7 +270,8 @@ export async function runSandboxed(
  * `registerFork` for the turn_end merge. Native routes and aborted/failed
  * runs never register — their fork (and its partial writes) is discarded,
  * which is what makes concurrent execution safe without any locking.
- * `localOps` is pi's createLocalBashOperations() result.
+ * `localOps` is pi's createLocalBashOperations() result; omit it for
+ * fail-closed (read-only) sandboxes — then nothing ever runs natively.
  */
 export function createOverlayBashOperations<F>(options: {
 	/** Fresh Bash over a fresh template fork, plus the fork to register on success. */
@@ -260,7 +279,7 @@ export function createOverlayBashOperations<F>(options: {
 	/** Register a sandboxed run's fork for the turn_end merge. */
 	registerFork(fork: F): void;
 	mapCwd: (hostCwd: string) => string | null;
-	localOps: BashOperations;
+	localOps?: BashOperations;
 	/**
 	 * Timeout (seconds) applied when the model omits `timeout` — covers BOTH
 	 * the sandboxed and native routes. Defaults to DEFAULT_TIMEOUT_SECONDS;
@@ -276,16 +295,20 @@ export function createOverlayBashOperations<F>(options: {
 					: callOptions;
 			const virtualCwd = options.mapCwd(hostCwd);
 			if (virtualCwd === null) {
+				if (!options.localOps) {
+					throw new Error(`Cannot map cwd onto the sandbox mounts: ${hostCwd}`);
+				}
 				const result = await options.localOps.exec(command, hostCwd, effectiveCallOptions);
 				return { exitCode: result.exitCode };
 			}
 			const { bash, fork } = options.forkBash();
+			const localOps = options.localOps;
 			const outcome = await execBashWithFallback(
 				{ command, hostCwd, virtualCwd, onData: effectiveCallOptions.onData },
 				{
 					analyze: (cmd) => bash.analyzeCommands(cmd),
 					execSandboxed: (cmd, cwd) => runSandboxed(bash, cmd, { ...effectiveCallOptions, virtualCwd: cwd }),
-					execNative: (cmd, cwd) => options.localOps.exec(cmd, cwd, effectiveCallOptions),
+					execNative: localOps ? (cmd, cwd) => localOps.exec(cmd, cwd, effectiveCallOptions) : undefined,
 				},
 			);
 			if (outcome.route === "sandboxed") options.registerFork(fork);

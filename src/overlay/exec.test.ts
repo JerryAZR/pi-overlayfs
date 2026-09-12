@@ -562,3 +562,98 @@ describe("sanitizeEnv", () => {
 		expect(sanitizeEnv(undefined)).toBeUndefined();
 	});
 });
+
+describe("fail-closed mode (no native fallback — read-only agents)", () => {
+	/** Same real-sandbox wiring, minus abortOnUnresolvedCommands and execNative. */
+	function roDeps(): { deps: BashExecDeps; fork: MountableFs } {
+		const fork = template.fork();
+		const bash = new Bash({ fs: fork, cwd: virtualProject, env: { HOME: "/home/user" } });
+		return {
+			deps: {
+				analyze: (cmd) => bash.analyzeCommands(cmd),
+				execSandboxed: (cmd, cwd) => runSandboxed(bash, cmd, { virtualCwd: cwd, onData: () => {} }),
+				// No execNative: any attempt to route native is a TypeError crash,
+				// which is itself the assertion that no native route was taken.
+			},
+			fork,
+		};
+	}
+
+	it("runs resolvable commands sandboxed, same as rw mode", async () => {
+		const { deps, fork } = roDeps();
+		const outcome = await execBashWithFallback(
+			{ command: "echo hi > note.txt", hostCwd: project, virtualCwd: virtualProject, onData: noOp },
+			deps,
+		);
+		expect(outcome.route).toBe("sandboxed");
+		expect(outcome.exitCode).toBe(0);
+		expect(fork.diff({ space: "vfs" }).writes.map((w) => path.posix.basename(w.path))).toContain("note.txt");
+	});
+
+	it("statically unresolved commands run sandboxed and 127 bash-style, no native", async () => {
+		const { deps } = roDeps();
+		const chunks: Buffer[] = [];
+		const outcome = await execBashWithFallback(
+			{
+				command: "echo before; definitely-not-a-real-command-xyz --flag; echo after",
+				hostCwd: project,
+				virtualCwd: virtualProject,
+				onData: (d) => chunks.push(d),
+			},
+			deps,
+		);
+		expect(outcome.route).toBe("sandboxed");
+		// Bash `;` lists return the LAST command's status (echo after → 0);
+		// the miss itself is reported in-band. (The 127 case is pinned by the
+		// runtime-composed test below.)
+		expect(outcome.exitCode).toBe(0);
+		const text = Buffer.concat(chunks).toString();		expect(text).toContain("before");
+		expect(text).toContain("after");
+		expect(text).toMatch(/command not found/i);
+	});
+
+	it("runtime-composed unresolved commands 127 in-sandbox too", async () => {
+		const { deps } = roDeps();
+		const outcome = await execBashWithFallback(
+			{ command: "$(echo someunknowncmd)", hostCwd: project, virtualCwd: virtualProject, onData: noOp },
+			deps,
+		);
+		expect(outcome.route).toBe("sandboxed");
+		expect(outcome.exitCode).toBe(127);
+	});
+
+	it("rm mixed with unresolved commands is NOT rejected: the gate guards native reruns, which do not exist here", async () => {
+		const { deps, fork } = roDeps();
+		await writeFile(path.join(project, "scratch.txt"), "x\n");
+		const outcome = await execBashWithFallback(
+			{ command: "rm scratch.txt && faketool --run", hostCwd: project, virtualCwd: virtualProject, onData: noOp },
+			deps,
+		);
+		expect(outcome.route).toBe("sandboxed");
+		expect(outcome.exitCode).toBe(127);
+		// The rm ran — inside the fork only; disk is untouched.
+		expect(fork.diff({ space: "vfs" }).deletions.some((d) => d.endsWith("scratch.txt"))).toBe(true);
+		expect(existsSync(path.join(project, "scratch.txt"))).toBe(true);
+	});
+
+	it("unparseable commands surface as a tool error (no native to degrade to)", async () => {
+		const { deps } = roDeps();
+		await expect(
+			execBashWithFallback(
+				{ command: 'ls "%USERPROFILE%\.pi\\" 2>nul', hostCwd: project, virtualCwd: virtualProject, onData: noOp },
+				deps,
+			),
+		).rejects.toThrow(/could not be parsed/i);
+	});
+
+	it("createOverlayBashOperations without localOps: unmappable cwd is a tool error", async () => {
+		const ops = createOverlayBashOperations({
+			forkBash: () => {
+				throw new Error("forkBash must not be reached");
+			},
+			registerFork: () => {},
+			mapCwd: () => null,
+		});
+		await expect(ops.exec("ls", project, { onData: noOp })).rejects.toThrow(/cannot map cwd/i);
+	});
+});
