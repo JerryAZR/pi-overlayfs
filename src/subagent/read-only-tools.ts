@@ -1,11 +1,9 @@
 /**
- * Sandboxed read-only bash + python tools for review/explore child sessions.
+ * Read-only tool surface (bash + python) for review/explore child sessions —
+ * the ro preset of the shared forked tool surface (src/overlay/tool-surface.ts).
  *
- * Read-only children run on the SAME execution model as the main session
- * (see src/overlay/index.ts): one VfsTemplate per child, a fresh copy-on-write
- * fork per call, and the same mount topology (canonicalized home at its
- * real-layout mount point, plus the project at its own when the child cwd
- * is outside home). The differences from the main session:
+ * Same engine as the main session: one VfsTemplate per child, a fresh
+ * copy-on-write fork per call, same mount topology. The ro knobs:
  *
  *   - Fail-closed: no localOps. Unresolved commands (npm, node, ...) 127
  *     bash-style in-band inside the sandbox — nothing ever runs natively.
@@ -21,14 +19,11 @@
  * with the fork.
  */
 
-import os from "node:os";
-import { createBashToolDefinition, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Bash, createVfsTemplate } from "@jerryan/just-bash";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Bash } from "@jerryan/just-bash";
 import { createGit, type GitCommandName } from "just-git";
-import { Type } from "typebox";
-import { createOverlayBashOperations, DEFAULT_TIMEOUT_SECONDS, type SandboxBash } from "../overlay/exec.js";
-import { computeOverlayTopology } from "../overlay/paths.js";
-import { createPythonToolDefinition } from "../overlay/tools/python.js";
+import type { SandboxBash } from "../overlay/exec.js";
+import { createForkedToolSurface } from "../overlay/tool-surface.js";
 
 /** Pure-mutator git verbs, disabled for clean UX errors. Fork drop-semantics enforce the rest. */
 const DISABLED_GIT: GitCommandName[] = [
@@ -71,23 +66,14 @@ const FS_ERROR_PATTERN =
  * share its /tmp scratch base, so temp scripts written via bash are visible
  * to later python calls.
  */
-export function createReadOnlySandboxTools(options: { cwd: string }): ToolDefinition<any>[] {
-	// Same mount topology as the main session's session_start (the helper is
-	// shared with src/overlay/index.ts).
-	//
+export function createReadOnlyTools(options: { cwd: string }): ToolDefinition<any>[] {
 	// TODO: mounts are read-write for now — add `readOnly: true` to each
-	// mount once the just-bash mount option lands upstream (one-line change
-	// here). Until then the no-op registerFork below is the write barrier:
-	// staged writes are dropped with each per-call fork.
-	const { cwd, mounts, mapper, virtualCwd, virtualHome } = computeOverlayTopology(options.cwd, os.homedir());
-	const template = createVfsTemplate({ mounts });
-
-	// Read-only children never merge: with read-write mounts this is interim
-	// drop-semantics until the readOnly mount option lands (TODO above).
-	const registerFork = () => {};
-
-	const bashOps = createOverlayBashOperations({
-		forkBash: () => {
+	// mount once the just-bash mount option lands upstream (one-line change,
+	// in tool-surface.ts). Until then the no-op registerFork below is the
+	// write barrier: staged writes are dropped with each per-call fork.
+	const surface = createForkedToolSurface({
+		cwd: options.cwd,
+		forkBash: ({ template, virtualCwd, virtualHome }) => {
 			const fork = template.fork();
 			const raw = new Bash({
 				fs: fork,
@@ -115,38 +101,11 @@ export function createReadOnlySandboxTools(options: { cwd: string }): ToolDefini
 			};
 			return { bash, fork };
 		},
-		registerFork,
-		mapCwd: (hostCwd) => mapper.hostToVirtual(hostCwd),
+		// Read-only children never merge: with read-write mounts this is
+		// interim drop-semantics until the readOnly mount option lands.
+		registerFork: () => {},
 		// No localOps: fail-closed — nothing ever runs natively.
 	});
 
-	// Built exactly like the main session's bash: the built-in definition
-	// (prompt, renderers, truncation) carries the fork routing via operations.
-	const bashDef = createBashToolDefinition(cwd, { operations: bashOps });
-	const bashTool = {
-		...bashDef,
-		// The built-in schema says "no default timeout"; the operations layer
-		// applies one (see exec.ts), so the schema must not lie.
-		parameters: Type.Object({
-			command: Type.String({ description: "Shell command to execute" }),
-			timeout: Type.Optional(
-				Type.Number({ description: `Timeout in seconds (optional, defaults to ${DEFAULT_TIMEOUT_SECONDS})` }),
-			),
-		}),
-	};
-
-	const pythonTool = createPythonToolDefinition({
-		forkBash: () => {
-			const fork = template.fork();
-			return {
-				bash: new Bash({ fs: fork, python: true, cwd: virtualCwd, env: { HOME: virtualHome } }),
-				fork,
-			};
-		},
-		registerFork,
-		resolveAbsolute: mapper.resolveToolPath,
-		virtualCwd,
-	});
-
-	return [bashTool, pythonTool] as unknown as ToolDefinition<any>[];
+	return [surface.tools.bash, surface.tools.python];
 }

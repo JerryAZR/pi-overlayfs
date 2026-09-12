@@ -54,7 +54,7 @@ import {
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { createUIBridge } from "./ui-bridge.js";
-import { createReadOnlySandboxTools } from "./sandbox-bash.js";
+import { createReadOnlyTools } from "./read-only-tools.js";
 import { renderSubagentCall, renderSubagentResult } from "./render.js";
 import { shortenPath, truncate, TOOL_LINE_PREFIX, type UsageStats } from "./tui.js";
 
@@ -703,7 +703,7 @@ async function defaultSpawnSession(
 		modelRuntime,
 		tools: role.tools ? [...role.tools] : undefined,
 		excludeTools: role.excludeTools,
-		customTools: role.sandboxTools ? createReadOnlySandboxTools({ cwd: opts.cwd }) : undefined,
+		customTools: role.sandboxTools ? createReadOnlyTools({ cwd: opts.cwd }) : undefined,
 		resourceLoader: loader,
 		sessionManager: SessionManager.inMemory(opts.cwd),
 		settingsManager,

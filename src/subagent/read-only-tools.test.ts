@@ -17,7 +17,7 @@ import * as path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
-import { createReadOnlySandboxTools } from "./sandbox-bash.js";
+import { createReadOnlyTools } from "./read-only-tools.js";
 
 let repoDir: string;
 let tools: ToolDefinition<any>[];
@@ -61,7 +61,7 @@ beforeAll(() => {
 	git("add .");
 	git("commit -q -m initial");
 
-	tools = createReadOnlySandboxTools({ cwd: repoDir });
+	tools = createReadOnlyTools({ cwd: repoDir });
 	bashTool = tools.find((t) => t.name === "bash")!;
 	pythonTool = tools.find((t) => t.name === "python")!;
 });

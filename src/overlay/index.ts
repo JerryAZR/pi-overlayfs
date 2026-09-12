@@ -14,27 +14,16 @@
  * back to native never register their fork, so their partial writes never
  * reach the merge; completed calls register regardless of exit code (effects
  * before a failure are legitimate).
+ *
+ * Tool construction is shared with read-only subagent sandboxes — see
+ * tool-surface.ts; this file is the rw configuration plus the finisher.
  */
 import { existsSync, statSync } from "node:fs";
-import os from "node:os";
-import { Type } from "typebox";
-import {
-	createBashToolDefinition,
-	createEditTool,
-	createEditToolDefinition,
-	createLocalBashOperations,
-	createReadTool,
-	createReadToolDefinition,
-	createWriteTool,
-	createWriteToolDefinition,
-	type ExtensionAPI,
-} from "@earendil-works/pi-coding-agent";
-import { Bash, createVfsTemplate, type MountableFs, type VfsTemplate } from "@jerryan/just-bash";
-import { createOverlayBashOperations, DEFAULT_TIMEOUT_SECONDS } from "./exec.js";
+import { createLocalBashOperations, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Bash, type MountableFs, type VfsTemplate } from "@jerryan/just-bash";
 import { applyChangeSetPerEntry, runFinisher } from "./finisher.js";
-import { computeOverlayTopology, type PathMapper } from "./paths.js";
-import { createOverlayEditOps, createOverlayReadOps, createOverlayWriteOps } from "./tools/file-ops.js";
-import { createPythonToolDefinition } from "./tools/python.js";
+import type { PathMapper } from "./paths.js";
+import { createForkedToolSurface } from "./tool-surface.js";
 
 /**
  * Proactive form of the mixed-call rule enforced in exec.ts: the model should
@@ -60,24 +49,13 @@ export default function (pi: ExtensionAPI) {
 	let state: SessionState | undefined;
 
 	pi.on("session_start", async (_event, ctx) => {
-		// Same topology as read-only subagent sandboxes (see
-		// computeOverlayTopology): the project is a subpath of the home overlay
-		// when inside home, a second mount at /project otherwise.
-		const { cwd, mounts, mapper, virtualCwd, virtualHome } = computeOverlayTopology(ctx.cwd, os.homedir());
-		const template = createVfsTemplate({ mounts });
-		const active: SessionState = { template, mapper, virtualCwd, turnForks: [] };
-		state = active;
-
-		const resolve = mapper.resolveToolPath;
-		const localBashOps = createLocalBashOperations();
-		const registerFork = (fork: MountableFs) => {
-			active.turnForks.push(fork);
-		};
-
-		// bash: operations carry the fork routing; the built-in definition
-		// (prompt, renderers, truncation) is reused unchanged.
-		const bashOps = createOverlayBashOperations({
-			forkBash: () => {
+		// The rw configuration of the shared tool surface: native fallback
+		// (localOps), real fork registration for the turn_end merge, and
+		// fail-fast unresolved detection (the fallback decision needs it).
+		let active: SessionState;
+		const surface = createForkedToolSurface({
+			cwd: ctx.cwd,
+			forkBash: ({ template, virtualCwd, virtualHome }) => {
 				const fork = template.fork();
 				return {
 					bash: new Bash({
@@ -89,87 +67,28 @@ export default function (pi: ExtensionAPI) {
 					fork,
 				};
 			},
-			registerFork,
-			mapCwd: (hostCwd) => mapper.hostToVirtual(hostCwd),
-			localOps: localBashOps,
+			registerFork: (fork) => {
+				active.turnForks.push(fork);
+			},
+			localOps: createLocalBashOperations(),
+			bashGuidelines: [BASH_SPLIT_GUIDELINE],
 		});
-		const bashDef = createBashToolDefinition(cwd, { operations: bashOps });
-		pi.registerTool({
-			...bashDef,
-			promptGuidelines: [...(bashDef.promptGuidelines ?? []), BASH_SPLIT_GUIDELINE],
-			// The built-in schema says "no default timeout"; this extension
-			// applies a default (see exec.ts), so the schema must not lie.
-			parameters: Type.Object({
-				command: Type.String({ description: "Shell command to execute" }),
-				timeout: Type.Optional(
-					Type.Number({ description: `Timeout in seconds (optional, defaults to ${DEFAULT_TIMEOUT_SECONDS})` }),
-				),
-			}),
-		});
-
-		// read/write/edit: built-in definitions; each call runs against a fresh
-		// fork (live disk for reads; registered for the merge on write success).
-		const readDef = createReadToolDefinition(cwd);
-		pi.registerTool({
-			...readDef,
-			execute: (id, params, signal, onUpdate) =>
-				createReadTool(cwd, { operations: createOverlayReadOps(template.fork(), resolve) }).execute(
-					id,
-					params,
-					signal,
-					onUpdate,
-				),
-			});
-
-		// write/edit share one shape: fresh fork → execute → register on
-		// completion (pi's tools throw on failure, so registration is
-		// success-gated; a failed call's fork — and any partial write — is
-		// simply never registered).
-		const forkedFileToolExecute = <T extends { execute: (...args: never[]) => Promise<unknown> }>(
-			makeTool: (fork: MountableFs) => T,
-		): T["execute"] => {
-			const wrapped = (async (...args: unknown[]) => {
-				const fork = template.fork();
-				const result = await makeTool(fork).execute(...(args as never[]));
-				registerFork(fork);
-				return result;
-			}) as T["execute"];
-			return wrapped;
+		active = {
+			template: surface.template,
+			mapper: surface.mapper,
+			virtualCwd: surface.virtualCwd,
+			turnForks: [],
 		};
+		state = active;
 
-		const writeDef = createWriteToolDefinition(cwd);
-		pi.registerTool({
-			...writeDef,
-			execute: forkedFileToolExecute(
-				(fork) => createWriteTool(cwd, { operations: createOverlayWriteOps(fork, resolve) }),
-			),
-		});
-
-		const editDef = createEditToolDefinition(cwd);
-		pi.registerTool({
-			...editDef,
-			execute: forkedFileToolExecute(
-				(fork) => createEditTool(cwd, { operations: createOverlayEditOps(fork, resolve) }),
-			),
-		});
-
-		pi.registerTool(
-			createPythonToolDefinition({
-				forkBash: () => {
-					const fork = template.fork();
-					return {
-						bash: new Bash({ fs: fork, python: true, cwd: virtualCwd, env: { HOME: virtualHome } }),
-						fork,
-					};
-				},
-				registerFork,
-				resolveAbsolute: resolve,
-				virtualCwd,
-			}),
-		);
+		pi.registerTool(surface.tools.bash);
+		pi.registerTool(surface.tools.read);
+		pi.registerTool(surface.tools.write);
+		pi.registerTool(surface.tools.edit);
+		pi.registerTool(surface.tools.python);
 
 		ctx.ui.notify(
-			`pi-overlayfs: sandboxing bash/read/write/edit/python over ${mounts.map((m) => m.at).join(", ")}`,
+			`pi-overlayfs: sandboxing bash/read/write/edit/python over ${surface.mounts.map((m) => m.at).join(", ")}`,
 			"info",
 		);
 	});
