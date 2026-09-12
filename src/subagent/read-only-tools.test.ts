@@ -1,5 +1,5 @@
 /**
- * Integration tests for the read-only sandbox tools (sandbox-bash.ts).
+ * Integration tests for the read-only child tool surface (read-only-tools.ts).
  *
  * These run the real just-bash interpreter (over real VfsTemplate forks on
  * real temp dirs) — the fail-closed routing and the just-git capability

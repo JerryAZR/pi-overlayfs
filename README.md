@@ -74,7 +74,7 @@ Four tools for spawning in-process subagent sessions (pi SDK `createAgentSession
 
 **Lifecycle:** agent ids are `<role>-<n>` and reported in every result footer. `follow_up` resumes the live session (auto-compacting first when context exceeds 50%). Agents idle for more than 10 owning-session turns are disposed by a recency sweep (never while streaming); everything is disposed at session shutdown.
 
-> **Interim state:** read-only mounts are currently read-write forks whose writes are dropped (never registered). A `readOnly` mount option in just-bash will switch enforcement to loud `EROFS` failures at the write site — a one-line change, marked with TODOs in `src/subagent/sandbox-bash.ts`.
+> **Interim state:** read-only mounts are currently read-write forks whose writes are dropped (never registered). A `readOnly` mount option in just-bash will switch enforcement to loud `EROFS` failures at the write site — a one-line change, marked with TODOs in `src/subagent/read-only-tools.ts`.
 
 ## Limitations
 
