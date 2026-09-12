@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { canonicalizeHostPathFs, createPathMapper, type OverlayEntry } from "./paths.js";
+import { canonicalizeHostPathFs, computeOverlayTopology, createPathMapper, type OverlayEntry } from "./paths.js";
 
 // Fixtures use win32-style and posix-style roots; each test pins the platform
 // explicitly so results are deterministic on any host. The win32 roots are
@@ -213,5 +213,51 @@ describe("paths: canonicalization (real fs)", () => {
 		});
 		expect(mapper.hostToVirtual("/tmp/home/project/src/x.ts")).toBe("/home/user/project/src/x.ts");
 		expect(mapper.isUnderProject("/tmp/home/project/src/x.ts")).toBe(true);
+	});
+});
+
+describe("computeOverlayTopology (shared by main session and read-only children)", () => {
+	let tmpRoot: string;
+
+	beforeEach(async () => {
+		tmpRoot = await mkdtemp(path.join(os.tmpdir(), "pi-overlayfs-topo-"));
+	});
+
+	afterEach(async () => {
+		await rm(tmpRoot, { recursive: true, force: true });
+	});
+
+	it("project inside home: single home mount, virtual cwd under /home/user", async () => {
+		const home = path.join(tmpRoot, "home");
+		const project = path.join(home, "project");
+		await mkdir(project, { recursive: true });
+		const t = computeOverlayTopology(project, home);
+		expect(t.mounts).toEqual([{ at: "/home/user", root: canonicalizeHostPathFs(home) }]);
+		expect(t.virtualCwd).toBe("/home/user/project");
+		expect(t.mapper.isUnderProject(t.cwd)).toBe(true);
+	});
+
+	it("project outside home: home + /project mounts, virtual cwd at /project", async () => {
+		const home = path.join(tmpRoot, "home");
+		const standalone = path.join(tmpRoot, "standalone");
+		await mkdir(home, { recursive: true });
+		await mkdir(standalone, { recursive: true });
+		const t = computeOverlayTopology(standalone, home);
+		expect(t.mounts.map((m) => m.at)).toEqual(["/home/user", "/project"]);
+		expect(t.mounts[1]!.root).toBe(canonicalizeHostPathFs(standalone));
+		expect(t.virtualCwd).toBe("/project");
+		expect(t.mapper.hostToVirtual(path.join(standalone, "src", "x.ts"))).toBe("/project/src/x.ts");
+	});
+
+	it("canonicalizes a symlinked cwd before computing mounts", async () => {
+		const home = path.join(tmpRoot, "home");
+		const project = path.join(home, "project");
+		await mkdir(project, { recursive: true });
+		const link = path.join(tmpRoot, "link");
+		// Junctions need no admin on Windows; plain symlink elsewhere.
+		await symlink(home, link, process.platform === "win32" ? "junction" : "dir");
+		const t = computeOverlayTopology(path.join(link, "project"), home);
+		expect(t.mounts).toHaveLength(1);
+		expect(t.virtualCwd).toBe("/home/user/project");
 	});
 });

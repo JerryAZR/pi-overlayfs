@@ -138,6 +138,43 @@ function stripExtendedLengthPrefix(p: string): string {
 	return p;
 }
 
+/**
+ * Mount topology shared by the main session and read-only subagent
+ * sandboxes: canonicalized home at "/home/user", plus the project at
+ * "/project" when the cwd is NOT inside home (otherwise the project is a
+ * subpath of the home overlay). Canonicalization happens up front (symlinked
+ * cwd / $HOME, e.g. macOS /tmp): the template realpaths its mount roots
+ * internally, and the mapper must compare against the same canonical
+ * spelling or every lookup misses (silent native fallback + outside-project
+ * misclassification).
+ */
+export interface OverlayTopology {
+	/** Canonicalized session cwd. */
+	cwd: string;
+	mounts: { at: string; root: string }[];
+	mapper: PathMapper;
+	virtualCwd: string;
+}
+
+export function computeOverlayTopology(cwdInput: string, homeInput: string): OverlayTopology {
+	const cwd = canonicalizeHostPathFs(cwdInput);
+	const home = canonicalizeHostPathFs(homeInput);
+	const rel = path.relative(home, cwd);
+	const projectInsideHome = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+	const mounts = projectInsideHome
+		? [{ at: "/home/user", root: home }]
+		: [
+				{ at: "/home/user", root: home },
+				{ at: "/project", root: cwd },
+			];
+	const mapper = createPathMapper({
+		overlays: mounts.map((m) => ({ mountPoint: m.at, root: m.root })),
+		projectRoot: cwd,
+	});
+	const virtualCwd = mapper.hostToVirtual(cwd) ?? "/";
+	return { cwd, mounts, mapper, virtualCwd };
+}
+
 export function createPathMapper(options: {
 	overlays: readonly OverlayEntry[];
 	projectRoot: string;

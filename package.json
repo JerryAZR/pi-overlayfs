@@ -13,22 +13,25 @@
 	},
 	"main": "./dist/extensions/overlayfs.js",
 	"scripts": {
-		"build": "tsc -p tsconfig.build.json",
+		"build": "tsc -p tsconfig.build.json && node -e \"require('node:fs').cpSync('src/subagent/prompts','dist/src/subagent/prompts',{recursive:true})\"",
 		"typecheck": "tsc -p tsconfig.json",
 		"test": "vitest run"
 	},
 	"dependencies": {
-		"@jerryan/just-bash": "^3.7.0"
+		"@jerryan/just-bash": "^3.7.0",
+		"just-git": "^1.8.0"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
 		"typebox": "*"
 	},
 	"devDependencies": {
 		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-server": "^0.85.0",
+		"@earendil-works/pi-tui": "*",
 		"@types/node": "^22.0.0",
 		"typebox": "*",
 		"typescript": "^5.6.0",

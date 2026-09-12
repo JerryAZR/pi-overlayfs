@@ -17,7 +17,6 @@
  */
 import { existsSync, statSync } from "node:fs";
 import os from "node:os";
-import path from "node:path";
 import { Type } from "typebox";
 import {
 	createBashToolDefinition,
@@ -33,7 +32,7 @@ import {
 import { Bash, createVfsTemplate, type MountableFs, type VfsTemplate } from "@jerryan/just-bash";
 import { createOverlayBashOperations, DEFAULT_TIMEOUT_SECONDS } from "./exec.js";
 import { applyChangeSetPerEntry, runFinisher } from "./finisher.js";
-import { canonicalizeHostPathFs, createPathMapper, type PathMapper } from "./paths.js";
+import { computeOverlayTopology, type PathMapper } from "./paths.js";
 import { createOverlayEditOps, createOverlayReadOps, createOverlayWriteOps } from "./tools/file-ops.js";
 import { createPythonToolDefinition } from "./tools/python.js";
 
@@ -61,29 +60,11 @@ export default function (pi: ExtensionAPI) {
 	let state: SessionState | undefined;
 
 	pi.on("session_start", async (_event, ctx) => {
-		// Canonicalize up front (symlinked cwd / $HOME, e.g. macOS /tmp): the
-		// template realpaths its mount roots internally, and the mapper must
-		// compare against the same canonical spelling or every lookup misses
-		// (silent native fallback + outside-project misclassification).
-		const cwd = canonicalizeHostPathFs(ctx.cwd);
-		const home = canonicalizeHostPathFs(os.homedir());
-		// Same topology as the long-lived agent sandbox: the project is a
-		// subpath of the home overlay when inside home, a second mount at
-		// /project otherwise.
-		const rel = path.relative(home, cwd);
-		const projectInsideHome = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
-		const mounts = projectInsideHome
-			? [{ at: "/home/user", root: home }]
-			: [
-					{ at: "/home/user", root: home },
-					{ at: "/project", root: cwd },
-				];
+		// Same topology as read-only subagent sandboxes (see
+		// computeOverlayTopology): the project is a subpath of the home overlay
+		// when inside home, a second mount at /project otherwise.
+		const { cwd, mounts, mapper, virtualCwd } = computeOverlayTopology(ctx.cwd, os.homedir());
 		const template = createVfsTemplate({ mounts });
-		const mapper = createPathMapper({
-			overlays: mounts.map((m) => ({ mountPoint: m.at, root: m.root })),
-			projectRoot: cwd,
-		});
-		const virtualCwd = mapper.hostToVirtual(cwd) ?? "/";
 		const active: SessionState = { template, mapper, virtualCwd, turnForks: [] };
 		state = active;
 
