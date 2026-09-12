@@ -2,12 +2,11 @@
  * Bidirectional host <-> virtual path mapping for the overlay sandbox.
  *
  * The template (see @jerryan/just-bash createVfsTemplate) mounts copy-on-write
- * overlays at virtual POSIX mount points:
- *   - home overlay    -> virtual "/home/user"  (root = real home dir)
- *   - project overlay -> virtual "/project"    (only when the project is NOT
- *                                               inside home; otherwise the
- *                                               project is a subpath of the
- *                                               home overlay)
+ * overlays at REAL-LAYOUT virtual mount points (virtualMountPointFor):
+ * the host root's own path, transformed — posix roots map to themselves;
+ * win32 roots map to MSYS form ("C:\\Users\\jerry" -> "/c/Users/jerry").
+ * One path form is therefore understood by BOTH the sandbox and the native
+ * route (pi's native shell on Windows is always an MSYS-family bash).
  *
  * Pure module (node:path only) so it can be unit-tested for both platforms
  * via the explicit `platform` option.
@@ -18,7 +17,7 @@ import path from "node:path";
 export type Platform = "win32" | "posix";
 
 export interface OverlayEntry {
-	/** Virtual mount point, e.g. "/home/user" or "/project". */
+	/** Virtual mount point (real-layout form, see virtualMountPointFor). */
 	mountPoint: string;
 	/** Real absolute host root backing the overlay. */
 	root: string;
@@ -44,12 +43,13 @@ export interface PathMapper {
 	 *     they are invisible to the sandbox anyway, so reads fail with ENOENT
 	 *     and writes land in throwaway memory.
 	 *  3. Windows drive-rooted fallback: a drive-rooted path under no overlay
-	 *     root ("C:\tmp\x", "D:\scratch\y") is almost always a virtual POSIX
+	 *     root ("C:\\tmp\\x", "D:\\scratch\\y") is almost always a virtual POSIX
 	 *     path the model typed that pi's host-side resolve() rooted at the
-	 *     session drive ("/tmp/x" -> "C:\tmp\x"). Strip the drive and treat it
-	 *     as virtual. Genuine outside-sandbox host paths get the same treatment
-	 *     (virtual-only, never applied to disk) — the sandbox cannot see them
-	 *     either way.
+	 *     session drive ("/tmp/x" -> "C:\\tmp\\x") — OR an MSYS-form path
+	 *     ("/c/tmp/x" -> "C:\\tmp\\x"). Map it to its real-layout virtual form
+	 *     ("/c/tmp/x"). Genuine outside-sandbox host paths get the same
+	 *     treatment (virtual-only, never applied to disk) — the sandbox cannot
+	 *     see them either way.
 	 */
 	resolveToolPath(absolutePath: string): string;
 }
@@ -77,6 +77,26 @@ function isWithin(root: string, child: string, platform: Platform): boolean {
 
 function isWindowsAbsolute(p: string): boolean {
 	return WINDOWS_ABSOLUTE.test(p) || UNC_PATH.test(p);
+}
+
+/**
+ * Virtual mount point for a host root: the real-layout transform that makes
+ * one path form meaningful to BOTH the sandbox and the native route (pi's
+ * native shell on Windows is always an MSYS-family bash, which understands
+ * the /c/... form natively).
+ *   win32: "C:\\Users\\jerry" -> "/c/Users/jerry"  (lowercase drive letter)
+ *   posix: "/home/jerry"      -> "/home/jerry"      (identity)
+ * UNC paths get separator normalization only (documented edge; such cwds
+ * route native anyway).
+ */
+export function virtualMountPointFor(hostRoot: string, platform?: Platform): string {
+	const plat = platform ?? (process.platform as Platform);
+	if (plat !== "win32") return toSlashes(hostRoot);
+	const normalized = toSlashes(hostRoot);
+	const drive = /^([A-Za-z]):\/(.*)$/.exec(normalized);
+	if (!drive) return normalized; // UNC or drive-less
+	const rest = drive[2]!.replace(/\/+$/, "");
+	return `/${drive[1]!.toLowerCase()}${rest ? `/${rest}` : ""}`;
 }
 
 /** Longest-overlay-root-prefix match for a host path. */
@@ -140,10 +160,10 @@ function stripExtendedLengthPrefix(p: string): string {
 
 /**
  * Mount topology shared by the main session and read-only subagent
- * sandboxes: canonicalized home at "/home/user", plus the project at
- * "/project" when the cwd is NOT inside home (otherwise the project is a
- * subpath of the home overlay). Canonicalization happens up front (symlinked
- * cwd / $HOME, e.g. macOS /tmp): the template realpaths its mount roots
+ * sandboxes: canonicalized home at its real-layout mount point, plus the
+ * project at its own real-layout mount point when the cwd is NOT inside
+ * home (otherwise the project is a subpath of the home overlay).
+ * Canonicalization happens up front (symlinked cwd / $HOME, e.g. macOS /tmp): the template realpaths its mount roots
  * internally, and the mapper must compare against the same canonical
  * spelling or every lookup misses (silent native fallback + outside-project
  * misclassification).
@@ -154,6 +174,8 @@ export interface OverlayTopology {
 	mounts: { at: string; root: string }[];
 	mapper: PathMapper;
 	virtualCwd: string;
+	/** Virtual mount point of the home overlay (value for the sandbox HOME env). */
+	virtualHome: string;
 }
 
 export function computeOverlayTopology(cwdInput: string, homeInput: string): OverlayTopology {
@@ -161,18 +183,19 @@ export function computeOverlayTopology(cwdInput: string, homeInput: string): Ove
 	const home = canonicalizeHostPathFs(homeInput);
 	const rel = path.relative(home, cwd);
 	const projectInsideHome = rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+	const virtualHome = virtualMountPointFor(home);
 	const mounts = projectInsideHome
-		? [{ at: "/home/user", root: home }]
+		? [{ at: virtualHome, root: home }]
 		: [
-				{ at: "/home/user", root: home },
-				{ at: "/project", root: cwd },
+				{ at: virtualHome, root: home },
+				{ at: virtualMountPointFor(cwd), root: cwd },
 			];
 	const mapper = createPathMapper({
 		overlays: mounts.map((m) => ({ mountPoint: m.at, root: m.root })),
 		projectRoot: cwd,
 	});
 	const virtualCwd = mapper.hostToVirtual(cwd) ?? "/";
-	return { cwd, mounts, mapper, virtualCwd };
+	return { cwd, mounts, mapper, virtualCwd, virtualHome };
 }
 
 export function createPathMapper(options: {
@@ -227,10 +250,9 @@ export function createPathMapper(options: {
 			if (absolutePath.startsWith("/") && !isWindowsAbsolute(absolutePath)) {
 				return absolutePath;
 			}
-			// Rule 3: Windows drive-rooted fallback — strip the drive, keep the rest.
+			// Rule 3: Windows drive-rooted fallback — real-layout virtual form.
 			if (platform === "win32" && WINDOWS_ABSOLUTE.test(absolutePath)) {
-				const withoutDrive = toSlashes(absolutePath.slice(2));
-				return withoutDrive.startsWith("/") ? withoutDrive : `/${withoutDrive}`;
+				return virtualMountPointFor(absolutePath, platform);
 			}
 			// UNC or anything else: treat as virtual with slash normalization.
 			return toSlashes(absolutePath).replace(/^\/\//, "/");

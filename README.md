@@ -9,7 +9,7 @@ A [pi](https://github.com/earendil-works/pi) package shipping two extensions bui
 
 ## What it does
 
-- The real home directory is mounted copy-on-write at virtual `/home/user`; the project directory is either a subpath of that overlay (when it lives inside home) or its own overlay at virtual `/project`. `/tmp` is shared scratch memory.
+- The real home directory is mounted copy-on-write at its **real-layout virtual path**: on POSIX that's the identical path (`/home/jerry` → `/home/jerry`); on Windows it's the MSYS form (`C:\Users\Jerry` → `/c/Users/Jerry`). The project directory is either a subpath of the home mount (when it lives inside home) or its own mount, also at its real-layout path. Because pi's native route always runs through an MSYS-family bash on Windows (and the real shell on POSIX), **one path form is understood by both the sandbox and native commands** — sandboxed `pwd` output can be pasted into a native command unchanged. `/tmp` is shared scratch memory (in-sandbox only; native commands see the host temp dir instead).
 - **Every tool call gets a fresh COW fork.** Writes land in the call's private memory layer and never touch disk directly; calls never see each other's uncommitted writes (fork(2) semantics — `/tmp` is the shared channel). Calls run fully concurrently: isolation comes from the topology, not from locking.
 - Once per turn — at `turn_end`, after **all** tool calls in the batch have completed (pi awaits every execution before emitting it, and awaits the finisher before the next LLM call) — the turn's forks are **merged** into one change set (deterministic: later `changedAt` wins conflicts, ties by completion order) and a finisher applies it to disk:
   - **Inside the project root** — auto-approved, applied immediately.
@@ -49,9 +49,9 @@ Exactly one of `code` / `path` is required. Paths may be host paths inside the p
 
 Tool operations receive absolute paths (pi resolves relative paths against the host session cwd). The adapter maps them to virtual paths:
 
-1. **Host mapping first** — a path under an overlay root (real home or project dir) maps onto that overlay's virtual mount point.
-2. **Already-virtual POSIX passthrough** — a path starting with `/` that is under no overlay root is used as-is (`/tmp/...`, `/project/...`). On POSIX hosts this means genuine host paths outside home/project (e.g. `/etc/...`) are seen as virtual: reads fail with ENOENT, writes land in throwaway memory.
-3. **Windows drive-rooted fallback** — a drive-rooted path under no overlay root (`C:\tmp\x`) is treated as a virtual POSIX path with the drive stripped (`/tmp/x`), because pi's host-side `resolve()` roots model-typed POSIX paths at the session drive.
+1. **Host mapping first** — a path under a mount root (real home or project dir) maps onto that root's real-layout mount point (`C:\Users\Jerry\x` → `/c/Users/Jerry/x`; `/home/jerry/x` → `/home/jerry/x`).
+2. **Already-virtual POSIX passthrough** — a path starting with `/` that is under no mount root is used as-is (`/tmp/...`, or an MSYS-form `/c/...` the model typed). On POSIX hosts this means genuine host paths outside home/project (e.g. `/etc/...`) are seen as virtual: reads fail with ENOENT, writes land in throwaway memory.
+3. **Windows drive-rooted fallback** — a drive-rooted path under no mount root (`C:\tmp\x`) maps to its real-layout virtual form (`/c/tmp/x`). pi's host-side `resolve()` roots both model-typed POSIX paths (`/tmp/x`) and MSYS paths (`/c/tmp/x`) at the session drive, and this rule maps both spellings to the same virtual path.
 
 ## Subagent tools
 
@@ -64,7 +64,7 @@ Four tools for spawning in-process subagent sessions (pi SDK `createAgentSession
 | `explore` | read-only | Mapping an unfamiliar project (any `cwd`) |
 | `follow_up` | — | Continue a live subagent's session with full context (`agent` id + new task) |
 
-**Read-only agents** (`review`/`explore`) run on the same engine as the main session — same mount topology (home at `/home/user`, project at `/project` when outside home), per-call forks, shared `/tmp` scratch — with three deliberate deltas:
+**Read-only agents** (`review`/`explore`) run on the same engine as the main session — same mount topology (real-layout home and project mounts), per-call forks, shared `/tmp` scratch — with three deliberate deltas:
 
 - **Fail-closed bash: no native fallback, ever.** Unresolved commands (`npm`, `node`, third-party CLIs) report `command not found` (exit 127) in-band instead of being rerouted to the host — a read-only agent has no host execution capability at all. `git` is provided *inside* the sandbox via [just-git](https://www.npmjs.com/package/just-git) with networking disabled (mutating verbs like `commit`/`checkout`/`reset` are disabled as UX; the fs boundary is the real enforcement).
 - **Nothing is ever merged or applied.** Forks are never registered, so there is no finisher, no confirm, no write path to disk.

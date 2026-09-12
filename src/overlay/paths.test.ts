@@ -3,7 +3,13 @@ import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { canonicalizeHostPathFs, computeOverlayTopology, createPathMapper, type OverlayEntry } from "./paths.js";
+import {
+	canonicalizeHostPathFs,
+	computeOverlayTopology,
+	createPathMapper,
+	virtualMountPointFor,
+	type OverlayEntry,
+} from "./paths.js";
 
 // Fixtures use win32-style and posix-style roots; each test pins the platform
 // explicitly so results are deterministic on any host. The win32 roots are
@@ -113,9 +119,11 @@ describe("paths: resolveToolPath heuristic", () => {
 		expect(mapper.resolveToolPath("/project/src/x.ts")).toBe("/project/src/x.ts");
 	});
 
-	it("rule 3: drive-rooted paths outside overlays are treated as virtual (pi-mangled POSIX)", () => {
-		// On Windows pi resolves "/tmp/x" against the session drive -> "C:\tmp\x".
-		expect(mapper.resolveToolPath("C:\\tmp\\x")).toBe("/tmp/x");
+	it("rule 3: drive-rooted paths outside overlays map to real-layout virtual form", () => {
+		// On Windows pi resolves "/tmp/x" against the session drive -> "C:\tmp\x",
+		// and "/c/tmp/x" (MSYS form) -> "C:\tmp\x" too. Both spellings land on
+		// the same real-layout virtual path.
+		expect(mapper.resolveToolPath("C:\\tmp\\x")).toBe("/c/tmp/x");
 	});
 
 	it("posix platform keeps rules 1-2 without drive stripping", () => {
@@ -216,6 +224,20 @@ describe("paths: canonicalization (real fs)", () => {
 	});
 });
 
+describe("virtualMountPointFor (real-layout transform)", () => {
+	it("win32: drive root becomes lowercase MSYS form", () => {
+		expect(virtualMountPointFor("C:\\Users\\Jerry", "win32")).toBe("/c/Users/Jerry");
+		expect(virtualMountPointFor("d:\\sandwork\\app", "win32")).toBe("/d/sandwork/app");
+		expect(virtualMountPointFor("C:\\", "win32")).toBe("/c");
+		expect(virtualMountPointFor("C:/Users/Jerry/", "win32")).toBe("/c/Users/Jerry");
+	});
+
+	it("posix: identity", () => {
+		expect(virtualMountPointFor("/home/jerry", "posix")).toBe("/home/jerry");
+		expect(virtualMountPointFor("/opt/app", "posix")).toBe("/opt/app");
+	});
+});
+
 describe("computeOverlayTopology (shared by main session and read-only children)", () => {
 	let tmpRoot: string;
 
@@ -227,26 +249,28 @@ describe("computeOverlayTopology (shared by main session and read-only children)
 		await rm(tmpRoot, { recursive: true, force: true });
 	});
 
-	it("project inside home: single home mount, virtual cwd under /home/user", async () => {
+	it("project inside home: single home mount at its real-layout point", async () => {
 		const home = path.join(tmpRoot, "home");
 		const project = path.join(home, "project");
 		await mkdir(project, { recursive: true });
 		const t = computeOverlayTopology(project, home);
-		expect(t.mounts).toEqual([{ at: "/home/user", root: canonicalizeHostPathFs(home) }]);
-		expect(t.virtualCwd).toBe("/home/user/project");
+		const vHome = virtualMountPointFor(canonicalizeHostPathFs(home));
+		expect(t.mounts).toEqual([{ at: vHome, root: canonicalizeHostPathFs(home) }]);
+		expect(t.virtualHome).toBe(vHome);
+		expect(t.virtualCwd).toBe(`${vHome}/project`);
 		expect(t.mapper.isUnderProject(t.cwd)).toBe(true);
 	});
 
-	it("project outside home: home + /project mounts, virtual cwd at /project", async () => {
+	it("project outside home: two real-layout mounts, virtual cwd at the project's", async () => {
 		const home = path.join(tmpRoot, "home");
 		const standalone = path.join(tmpRoot, "standalone");
 		await mkdir(home, { recursive: true });
 		await mkdir(standalone, { recursive: true });
 		const t = computeOverlayTopology(standalone, home);
-		expect(t.mounts.map((m) => m.at)).toEqual(["/home/user", "/project"]);
-		expect(t.mounts[1]!.root).toBe(canonicalizeHostPathFs(standalone));
-		expect(t.virtualCwd).toBe("/project");
-		expect(t.mapper.hostToVirtual(path.join(standalone, "src", "x.ts"))).toBe("/project/src/x.ts");
+		const vStandalone = virtualMountPointFor(canonicalizeHostPathFs(standalone));
+		expect(t.mounts.map((m) => m.at)).toEqual([virtualMountPointFor(canonicalizeHostPathFs(home)), vStandalone]);
+		expect(t.virtualCwd).toBe(vStandalone);
+		expect(t.mapper.hostToVirtual(path.join(standalone, "src", "x.ts"))).toBe(`${vStandalone}/src/x.ts`);
 	});
 
 	it("canonicalizes a symlinked cwd before computing mounts", async () => {
@@ -258,6 +282,6 @@ describe("computeOverlayTopology (shared by main session and read-only children)
 		await symlink(home, link, process.platform === "win32" ? "junction" : "dir");
 		const t = computeOverlayTopology(path.join(link, "project"), home);
 		expect(t.mounts).toHaveLength(1);
-		expect(t.virtualCwd).toBe("/home/user/project");
+		expect(t.virtualCwd).toBe(`${virtualMountPointFor(canonicalizeHostPathFs(home))}/project`);
 	});
 });

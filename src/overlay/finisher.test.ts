@@ -33,6 +33,8 @@ beforeEach(async () => {
 	project = path.join(home, "project");
 	await mkdir(project, { recursive: true });
 	await writeFile(path.join(project, "seed.txt"), "seed\n");
+	// Fixture mount name is arbitrary (these tests exercise exec/finisher/python machinery,
+	// not topology); production mounts are real-layout — see computeOverlayTopology.
 	template = createVfsTemplate({ mounts: [{ at: "/home/user", root: home }] });
 	mapper = createPathMapper({
 		overlays: [{ mountPoint: "/home/user", root: home }],

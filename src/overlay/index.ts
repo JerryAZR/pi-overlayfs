@@ -63,7 +63,7 @@ export default function (pi: ExtensionAPI) {
 		// Same topology as read-only subagent sandboxes (see
 		// computeOverlayTopology): the project is a subpath of the home overlay
 		// when inside home, a second mount at /project otherwise.
-		const { cwd, mounts, mapper, virtualCwd } = computeOverlayTopology(ctx.cwd, os.homedir());
+		const { cwd, mounts, mapper, virtualCwd, virtualHome } = computeOverlayTopology(ctx.cwd, os.homedir());
 		const template = createVfsTemplate({ mounts });
 		const active: SessionState = { template, mapper, virtualCwd, turnForks: [] };
 		state = active;
@@ -83,7 +83,7 @@ export default function (pi: ExtensionAPI) {
 					bash: new Bash({
 						fs: fork,
 						cwd: virtualCwd,
-						env: { HOME: "/home/user" },
+						env: { HOME: virtualHome },
 						abortOnUnresolvedCommands: true,
 					}),
 					fork,
@@ -158,7 +158,7 @@ export default function (pi: ExtensionAPI) {
 				forkBash: () => {
 					const fork = template.fork();
 					return {
-						bash: new Bash({ fs: fork, python: true, cwd: virtualCwd, env: { HOME: "/home/user" } }),
+						bash: new Bash({ fs: fork, python: true, cwd: virtualCwd, env: { HOME: virtualHome } }),
 						fork,
 					};
 				},

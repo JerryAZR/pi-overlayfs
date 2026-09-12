@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import extension from "./index.js";
+import { canonicalizeHostPathFs, virtualMountPointFor } from "./paths.js";
 
 /**
  * Wiring test: drives the extension's default export with a minimal fake pi
@@ -350,7 +351,7 @@ describe("extension wiring (fake pi, real sandbox)", () => {
 	});
 });
 
-describe("project-outside-home topology (two mounts: /home/user + /project)", () => {
+describe("project-outside-home topology (two real-layout mounts)", () => {
 	it("project writes auto-apply; home writes prompt; notify lists both mounts", async () => {
 		const standalone = path.join(tmpRoot, "standalone");
 		await mkdir(standalone);
@@ -367,8 +368,10 @@ describe("project-outside-home topology (two mounts: /home/user + /project)", ()
 		});
 		await startSession(fake, standalone, ctx);
 
-		// Both mounts announced at session start.
-		expect(notifications.some((n) => n.includes("/home/user") && n.includes("/project"))).toBe(true);
+		// Both mounts announced at session start (real-layout mount points).
+		const vHome = virtualMountPointFor(canonicalizeHostPathFs(home));
+		const vStandalone = virtualMountPointFor(canonicalizeHostPathFs(standalone));
+		expect(notifications.some((n) => n.includes(vHome) && n.includes(vStandalone))).toBe(true);
 
 		const write = toolByName(fake, "write");
 		// Inside the project → auto-approved, no dialog.

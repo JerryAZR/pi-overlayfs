@@ -3,9 +3,9 @@
  *
  * Read-only children run on the SAME execution model as the main session
  * (see src/overlay/index.ts): one VfsTemplate per child, a fresh copy-on-write
- * fork per call, and the same mount topology (canonicalized home at
- * /home/user, plus the project at /project when the child cwd is outside
- * home). The differences from the main session:
+ * fork per call, and the same mount topology (canonicalized home at its
+ * real-layout mount point, plus the project at its own when the child cwd
+ * is outside home). The differences from the main session:
  *
  *   - Fail-closed: no localOps. Unresolved commands (npm, node, ...) 127
  *     bash-style in-band inside the sandbox — nothing ever runs natively.
@@ -79,7 +79,7 @@ export function createReadOnlySandboxTools(options: { cwd: string }): ToolDefini
 	// mount once the just-bash mount option lands upstream (one-line change
 	// here). Until then the no-op registerFork below is the write barrier:
 	// staged writes are dropped with each per-call fork.
-	const { cwd, mounts, mapper, virtualCwd } = computeOverlayTopology(options.cwd, os.homedir());
+	const { cwd, mounts, mapper, virtualCwd, virtualHome } = computeOverlayTopology(options.cwd, os.homedir());
 	const template = createVfsTemplate({ mounts });
 
 	// Read-only children never merge: with read-write mounts this is interim
@@ -92,7 +92,7 @@ export function createReadOnlySandboxTools(options: { cwd: string }): ToolDefini
 			const raw = new Bash({
 				fs: fork,
 				cwd: virtualCwd,
-				env: { HOME: "/home/user" },
+				env: { HOME: virtualHome },
 				// abortOnUnresolvedCommands stays off (default): unresolved
 				// commands 127 bash-style in-band — the fail-closed behavior.
 				customCommands: [createGit({ network: false, disabled: DISABLED_GIT })],
@@ -139,7 +139,7 @@ export function createReadOnlySandboxTools(options: { cwd: string }): ToolDefini
 		forkBash: () => {
 			const fork = template.fork();
 			return {
-				bash: new Bash({ fs: fork, python: true, cwd: virtualCwd, env: { HOME: "/home/user" } }),
+				bash: new Bash({ fs: fork, python: true, cwd: virtualCwd, env: { HOME: virtualHome } }),
 				fork,
 			};
 		},
