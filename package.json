@@ -1,17 +1,17 @@
 {
 	"name": "pi-overlayfs",
 	"version": "0.1.0",
-	"description": "Route pi's file-touching tools through a copy-on-write overlay filesystem with a per-tool-call apply/approve finisher",
+	"description": "Route pi's file-touching tools through copy-on-write filesystem forks, and spawn subagents on the same execution model",
 	"type": "module",
 	"keywords": [
 		"pi-package"
 	],
 	"pi": {
 		"extensions": [
-			"./src/index.ts"
+			"./extensions"
 		]
 	},
-	"main": "./dist/index.js",
+	"main": "./dist/extensions/overlayfs.js",
 	"scripts": {
 		"build": "tsc -p tsconfig.build.json",
 		"typecheck": "tsc -p tsconfig.json",
