@@ -1,6 +1,11 @@
 # pi-overlayfs
 
-A [pi](https://github.com/earendil-works/pi) extension that routes pi's file-touching tools — **bash, read, write, edit**, plus a new **python** tool — through per-call copy-on-write filesystem forks ([@jerryan/just-bash](https://www.npmjs.com/package/@jerryan/just-bash) `createVfsTemplate`).
+A [pi](https://github.com/earendil-works/pi) package shipping two extensions built on one execution engine — per-call copy-on-write filesystem forks ([@jerryan/just-bash](https://www.npmjs.com/package/@jerryan/just-bash) `createVfsTemplate`):
+
+1. **overlayfs** (`extensions/overlayfs.ts`) — routes pi's file-touching tools (**bash, read, write, edit**, plus a new **python** tool) through the fork machinery with a per-turn apply/approve finisher.
+2. **subagents** (`extensions/subagents.ts`) — **delegate / review / explore / follow_up** tools. Read-only agents run fail-closed on the same engine; delegate agents are ordinary pi sessions that inherit the overlayfs extension themselves.
+
+> **Incompatible with [pi-subagent-tools](https://www.npmjs.com/package/@jerryan/pi-subagent-tools):** the subagents extension registers the same four tool names. Install one or the other, not both.
 
 ## What it does
 
@@ -48,6 +53,29 @@ Tool operations receive absolute paths (pi resolves relative paths against the h
 2. **Already-virtual POSIX passthrough** — a path starting with `/` that is under no overlay root is used as-is (`/tmp/...`, `/project/...`). On POSIX hosts this means genuine host paths outside home/project (e.g. `/etc/...`) are seen as virtual: reads fail with ENOENT, writes land in throwaway memory.
 3. **Windows drive-rooted fallback** — a drive-rooted path under no overlay root (`C:\tmp\x`) is treated as a virtual POSIX path with the drive stripped (`/tmp/x`), because pi's host-side `resolve()` roots model-typed POSIX paths at the session drive.
 
+## Subagent tools
+
+Four tools for spawning in-process subagent sessions (pi SDK `createAgentSession` — sessions, not subprocesses):
+
+| Tool | Surface | Purpose |
+| --- | --- | --- |
+| `delegate` | full tools (inherits all extensions) | General-purpose work that needs write access |
+| `review` | read-only | Code/diff review in the current project |
+| `explore` | read-only | Mapping an unfamiliar project (any `cwd`) |
+| `follow_up` | — | Continue a live subagent's session with full context (`agent` id + new task) |
+
+**Read-only agents** (`review`/`explore`) run on the same engine as the main session — same mount topology (home at `/home/user`, project at `/project` when outside home), per-call forks, shared `/tmp` scratch — with three deliberate deltas:
+
+- **Fail-closed bash: no native fallback, ever.** Unresolved commands (`npm`, `node`, third-party CLIs) report `command not found` (exit 127) in-band instead of being rerouted to the host — a read-only agent has no host execution capability at all. `git` is provided *inside* the sandbox via [just-git](https://www.npmjs.com/package/just-git) with networking disabled (mutating verbs like `commit`/`checkout`/`reset` are disabled as UX; the fs boundary is the real enforcement).
+- **Nothing is ever merged or applied.** Forks are never registered, so there is no finisher, no confirm, no write path to disk.
+- **python** is available (same sandboxed CPython, same fs), so read-only agents can write and run temporary analysis scripts in `/tmp`.
+
+**Delegate agents** are plain pi sessions: they load extensions naturally — including this package's overlayfs extension, which gives each delegate its own template and per-`turn_end` finisher (its confirms surface in the parent TUI through a serialized dialog bridge) — and this subagents extension, so delegates can themselves spawn review/explore agents. Recursion is bounded structurally: `delegate` is denied to child sessions (`excludeTools`), and read-only children load no extensions at all, so the chain can never grow past delegate → read-only.
+
+**Lifecycle:** agent ids are `<role>-<n>` and reported in every result footer. `follow_up` resumes the live session (auto-compacting first when context exceeds 50%). Agents idle for more than 10 owning-session turns are disposed by a recency sweep (never while streaming); everything is disposed at session shutdown.
+
+> **Interim state:** read-only mounts are currently read-write forks whose writes are dropped (never registered). A `readOnly` mount option in just-bash will switch enforcement to loud `EROFS` failures at the write site — a one-line change, marked with TODOs in `src/subagent/sandbox-bash.ts`.
+
 ## Limitations
 
 - **No output streaming from the sandbox.** just-bash executes a command to completion and returns all output at once, so bash output appears only when the command finishes (buffered stdout first, then stderr — interleaved ordering is not preserved). Native-fallback commands stream as usual. Also note that on abort/timeout just-bash itself discards accumulated stdout (only its abort diagnostic survives); whatever partial output the sandbox does preserve is emitted before the `timeout:<s>`/`aborted` error is raised.
@@ -82,4 +110,6 @@ npm test            # vitest (unit tests against a real vfs template on temp dir
 npm run build       # emit dist/
 ```
 
-Load with `pi -e /path/to/pi-overlayfs`.
+Layout: `extensions/` holds the two thin extension entries; `src/overlay/` is the shared engine (fork topology, bash/python execution, finisher, path mapping); `src/subagent/` is the subagent extension's implementation.
+
+Load with `pi -e /path/to/pi-overlayfs` (both extensions).
