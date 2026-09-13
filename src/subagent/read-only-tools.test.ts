@@ -134,6 +134,11 @@ describe("read-only enforcement (EROFS)", () => {
 		expect(fs.existsSync(path.join(repoDir, "newdir"))).toBe(false);
 	});
 
+	it("the home mount is read-only too", async () => {
+		const msg = await errorOf("echo x > ~/probe-should-fail.txt");
+		expect(msg).toMatch(/EROFS|read-only/i);
+	});
+
 	it("dual-purpose git write modes fail while read modes keep working", async () => {
 		await errorOf("git branch test-branch");
 		const branches = await textOf("git branch");

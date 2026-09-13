@@ -25,7 +25,7 @@ import { createGit, type GitCommandName } from "just-git";
 import type { SandboxBash } from "../overlay/exec.js";
 import { createForkedToolSurface } from "../overlay/tool-surface.js";
 
-/** Pure-mutator git verbs, disabled for clean UX errors. Fork drop-semantics enforce the rest. */
+/** Pure-mutator git verbs, disabled for clean UX errors. The EROFS mounts enforce the rest. */
 const DISABLED_GIT: GitCommandName[] = [
 	"init",
 	"add",
