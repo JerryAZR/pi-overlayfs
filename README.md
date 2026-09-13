@@ -7,6 +7,15 @@ A [pi](https://github.com/earendil-works/pi) package shipping two extensions bui
 
 > **Incompatible with [pi-subagent-tools](https://www.npmjs.com/package/@jerryan/pi-subagent-tools):** the subagents extension registers the same four tool names. Install one or the other, not both.
 
+## Tools defined
+
+| Extension | Tool names |
+|---|---|
+| overlayfs | `bash`, `read`, `write`, `edit` (replacing pi's built-ins by name), `python` (new) |
+| subagents | `delegate`, `review`, `explore`, `follow_up` (new) |
+
+The built-in replacements are intentional name overrides. If another extension registers the same tool names, pi's first-registration-wins rule decides which implementation is active.
+
 ## What it does
 
 - The real home directory is mounted copy-on-write at its **real-layout virtual path**: on POSIX that's the identical path (`/home/jerry` → `/home/jerry`); on Windows it's the MSYS form (`C:\Users\Jerry` → `/c/Users/Jerry`). The project directory is either a subpath of the home mount (when it lives inside home) or its own mount, also at its real-layout path. Because pi's native route always runs through an MSYS-family bash on Windows (and the real shell on POSIX), **one path form is understood by both the sandbox and native commands** — sandboxed `pwd` output can be pasted into a native command unchanged. `/tmp` is shared scratch memory (in-sandbox only; native commands see the host temp dir instead).

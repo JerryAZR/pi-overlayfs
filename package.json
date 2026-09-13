@@ -2,6 +2,16 @@
 	"name": "pi-overlayfs",
 	"version": "0.1.0",
 	"description": "Route pi's file-touching tools through copy-on-write filesystem forks, and spawn subagents on the same execution model",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/JerryAZR/pi-overlayfs.git"
+	},
+	"files": [
+		"extensions",
+		"src",
+		"!src/**/*.test.ts"
+	],
 	"type": "module",
 	"keywords": [
 		"pi-package"
@@ -11,7 +21,6 @@
 			"./extensions"
 		]
 	},
-	"main": "./dist/extensions/overlayfs.js",
 	"scripts": {
 		"build": "tsc -p tsconfig.build.json && node -e \"require('node:fs').cpSync('src/subagent/prompts','dist/src/subagent/prompts',{recursive:true})\"",
 		"typecheck": "tsc -p tsconfig.json",
