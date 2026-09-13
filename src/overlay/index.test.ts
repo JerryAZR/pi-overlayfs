@@ -345,8 +345,10 @@ describe("extension wiring (fake pi, real sandbox)", () => {
 		await turnEnd(fake, ctx);
 		expect(asked).toHaveLength(1);
 		// Loose on presentation (that's a UI choice), strict on content: the
-		// outside path must reach the dialog.
+		// outside path AND its change code (git status --short vocabulary:
+		// A/M/D) must reach the dialog — asked.txt is new, so "A".
 		expect(asked[0]!.message).toContain("asked.txt");
+		expect(asked[0]!.message).toMatch(/ A .*asked\.txt/);
 		expect(readFileSync(outside, "utf8")).toBe("y\n");
 	});
 });

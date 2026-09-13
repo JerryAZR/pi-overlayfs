@@ -21,7 +21,7 @@
 import { existsSync, statSync } from "node:fs";
 import { createLocalBashOperations, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Bash, type MountableFs, type VfsTemplate } from "@jerryan/just-bash";
-import { applyChangeSetPerEntry, runFinisher } from "./finisher.js";
+import { applyChangeSetPerEntry, formatLabeledChange, runFinisher } from "./finisher.js";
 import type { PathMapper } from "./paths.js";
 import { createForkedToolSurface } from "./tool-surface.js";
 
@@ -124,11 +124,12 @@ export default function (pi: ExtensionAPI) {
 						return false;
 					}
 				},
+				pathExists: (p) => existsSync(p),
 				confirm: ctx.hasUI
-					? (outsidePaths) =>
+					? (outside) =>
 							ctx.ui.confirm(
-								`${outsidePaths.length} staged change${outsidePaths.length === 1 ? "" : "s"} outside project root`,
-								`The sandbox staged changes outside the project root:\n\n${outsidePaths.join("\n")}\n\nApply them to disk?`,
+								`${outside.length} staged change${outside.length === 1 ? "" : "s"} outside project root`,
+								`The sandbox staged changes outside the project root:\n\n${outside.map(formatLabeledChange).join("\n")}\n\nApply them to disk?`,
 							)
 					: undefined,
 				outsidePolicy: () => process.env.PI_OVERLAYFS_OUTSIDE_PROJECT,
@@ -157,17 +158,17 @@ export default function (pi: ExtensionAPI) {
 		// via a steering message before its next LLM call.
 		const sections: string[] = [];
 		if (report.denied.length > 0) {
-			const paths = report.denied;
+			const changes = report.denied;
 			sections.push(
-				`${paths.length} change${paths.length === 1 ? "" : "s"} outside the project root ` +
-					`were rejected and discarded without touching disk:\n${paths.map((p) => `- ${p}`).join("\n")}`,
+				`${changes.length} change${changes.length === 1 ? "" : "s"} outside the project root ` +
+					`were rejected and discarded without touching disk:\n${changes.map(formatLabeledChange).join("\n")}`,
 			);
 		}
 		if (report.failed && report.failed.paths.length > 0) {
-			const paths = report.failed.paths;
+			const changes = report.failed.paths;
 			sections.push(
-				`${paths.length} staged change${paths.length === 1 ? "" : "s"} could not be written to disk ` +
-					`and were discarded:\n${paths.map((p) => `- ${p}`).join("\n")}`,
+				`${changes.length} staged change${changes.length === 1 ? "" : "s"} could not be written to disk ` +
+					`and were discarded:\n${changes.map(formatLabeledChange).join("\n")}`,
 			);
 		}
 		if (sections.length > 0) {

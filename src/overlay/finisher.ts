@@ -19,6 +19,22 @@ export interface ApplyFailure {
 	error: string;
 }
 
+/**
+ * A staged change with a git-status-style code (A/M/D, `git status --short`
+ * vocabulary). The overlay has no rename detection: a move is D + A, a
+ * symlink replacing a file is D + A. `target` is the symlink target for
+ * symlink writes.
+ */
+export interface LabeledChange {
+	code: "A" | "M" | "D";
+	path: string;
+	target?: string;
+}
+
+export function formatLabeledChange(change: LabeledChange): string {
+	return ` ${change.code} ${change.path}${change.target !== undefined ? ` -> ${change.target}` : ""}`;
+}
+
 export interface FinisherDeps {
 	/** The merged host-space change set for this turn. */
 	diff(): OverlayDiff;
@@ -30,8 +46,10 @@ export interface FinisherDeps {
 	isUnderProject(realPath: string): boolean;
 	/** True when the real path currently exists on disk as a directory. */
 	isExistingDirectory(realPath: string): boolean;
-	/** Ask the user once about the outside-project paths. Undefined when headless. */
-	confirm?(outsidePaths: string[]): Promise<boolean>;
+	/** True when the real path currently exists on disk (A vs M labels). */
+	pathExists(realPath: string): boolean;
+	/** Ask the user once about the outside-project changes. Undefined when headless. */
+	confirm?(outside: LabeledChange[]): Promise<boolean>;
 	/** Headless policy from PI_OVERLAYFS_OUTSIDE_PROJECT ("approve" | anything else = drop). */
 	outsidePolicy(): string | undefined;
 }
@@ -39,13 +57,13 @@ export interface FinisherDeps {
 export interface FinisherReport {
 	/** Entries applied to disk (inside-project auto-approved + approved outside). */
 	applied: number;
-	/** Outside-project paths DENIED by the user or the headless policy → not applied. */
-	denied: string[];
+	/** Outside-project changes DENIED by the user or the headless policy → not applied. */
+	denied: LabeledChange[];
 	/**
 	 * Approved but FAILED to apply (per-entry apply errors, or a confirm
 	 * error). paths names exactly what was lost.
 	 */
-	failed: { error: string; paths: string[] } | null;
+	failed: { error: string; paths: LabeledChange[] } | null;
 }
 
 function isNoOpDirectoryWrite(write: OverlayWrite, isExistingDirectory: (p: string) => boolean): boolean {
@@ -89,6 +107,30 @@ export function partitionChanges(
 
 function realPathsOf(changes: OverlayDiff): string[] {
 	return [...changes.deletions, ...changes.writes.map((w) => w.path)];
+}
+
+const textDecoder = new TextDecoder();
+
+function labelWrite(write: OverlayWrite, pathExists: (p: string) => boolean): LabeledChange {
+	if (write.nodeType === "symlink") {
+		return {
+			code: pathExists(write.path) ? "M" : "A",
+			path: write.path,
+			target: textDecoder.decode(write.content),
+		};
+	}
+	if (write.metadataOnly) return { code: "M", path: write.path };
+	// Directory entries whose target already exists are filtered before
+	// labeling (mkdir -p no-ops); a staged directory that reaches here is new.
+	return { code: pathExists(write.path) ? "M" : "A", path: write.path };
+}
+
+/** Git-status-style labels for a change set (A/M/D — see LabeledChange). */
+export function labelChanges(changes: OverlayDiff, pathExists: (p: string) => boolean): LabeledChange[] {
+	return [
+		...changes.deletions.map((path): LabeledChange => ({ code: "D", path })),
+		...changes.writes.map((w) => labelWrite(w, pathExists)),
+	];
 }
 
 function errorMessage(error: unknown): string {
@@ -141,6 +183,11 @@ export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 
 	const { inside, outside } = partitionChanges(changes, deps.isUnderProject, deps.isExistingDirectory);
 	const failures: ApplyFailure[] = [];
+	// Labels for every staged path (inside and outside) so reports and the
+	// confirm can all speak in A/M/D. A path staged as both deletion and
+	// write is an odd race survivor; last label wins, the apply decides.
+	const labels = new Map(labelChanges(changes, deps.pathExists).map((l) => [l.path, l]));
+	const labeled = (path: string): LabeledChange => labels.get(path) ?? { code: "M", path };
 
 	if (inside.writes.length > 0 || inside.deletions.length > 0) {
 		const failed = await deps.applyChanges(inside);
@@ -149,12 +196,12 @@ export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 	}
 
 	if (outside.writes.length > 0 || outside.deletions.length > 0) {
-		const outsidePaths = realPathsOf(outside);
+		const outsideChanges = realPathsOf(outside).map(labeled);
 		let approved = false;
 		let confirmError: unknown;
 		try {
 			approved = deps.confirm
-				? await deps.confirm(outsidePaths)
+				? await deps.confirm(outsideChanges)
 				: deps.outsidePolicy()?.toLowerCase() === "approve";
 		} catch (error) {
 			confirmError = error;
@@ -162,18 +209,18 @@ export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 
 		if (confirmError !== undefined) {
 			const message = errorMessage(confirmError);
-			failures.push(...outsidePaths.map((p) => ({ path: p, error: message })));
+			failures.push(...realPathsOf(outside).map((p) => ({ path: p, error: message })));
 		} else if (approved) {
 			const failed = await deps.applyChanges(outside);
 			failures.push(...failed);
-			report.applied += outsidePaths.length - failed.length;
+			report.applied += outsideChanges.length - failed.length;
 		} else {
-			report.denied = outsidePaths;
+			report.denied = outsideChanges;
 		}
 	}
 
 	if (failures.length > 0) {
-		report.failed = { error: failures[0]!.error, paths: failures.map((f) => f.path) };
+		report.failed = { error: failures[0]!.error, paths: failures.map((f) => labeled(f.path)) };
 	}
 	return report;
 }

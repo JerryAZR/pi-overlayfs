@@ -10,6 +10,7 @@ import {
 	type VfsTemplate,
 } from "@jerryan/just-bash";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { labelChanges } from "./finisher.js";
 import {
 	applyChangeSetPerEntry,
 	partitionChanges,
@@ -81,6 +82,7 @@ function makeDeps(diff: OverlayDiff, overrides: Partial<FinisherDeps> = {}): Fin
 				return false;
 			}
 		},
+		pathExists: (p) => existsSync(p),
 		outsidePolicy: () => undefined,
 		...overrides,
 	};
@@ -136,7 +138,11 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 		// the home overlay; those dirs already exist on disk.
 		await stage("echo x > staged.txt");
 		const confirmedPaths: string[][] = [];
-		await runFinisher(makeDeps(await mergedHostDiff(), { confirm: async (paths) => (confirmedPaths.push(paths), true) }));
+		await runFinisher(
+			makeDeps(await mergedHostDiff(), {
+				confirm: async (changes) => (confirmedPaths.push(changes.map((c) => c.path)), true),
+			}),
+		);
 
 		expect(confirmedPaths).toEqual([]);
 	});
@@ -146,8 +152,8 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 		const confirmedPaths: string[][] = [];
 		const report = await runFinisher(
 			makeDeps(await mergedHostDiff(), {
-				confirm: async (paths) => {
-					confirmedPaths.push(paths);
+				confirm: async (changes) => {
+					confirmedPaths.push(changes.map((c) => c.path));
 					return true;
 				},
 			}),
@@ -165,7 +171,8 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
 		// …and reported for the post-turn steering warning.
 		expect(report.denied).toHaveLength(1);
-		expect(report.denied[0]!.replace(/\\/g, "/")).toContain("outside.txt");
+		expect(report.denied[0]!.code).toBe("A");
+		expect(report.denied[0]!.path.replace(/\\/g, "/")).toContain("outside.txt");
 	});
 
 	it("headless: honors PI_OVERLAYFS_OUTSIDE_PROJECT-style policy", async () => {
@@ -178,7 +185,7 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 		const deniedReport = await runFinisher(makeDeps(await mergedHostDiff(), { outsidePolicy: () => undefined }));
 		expect(existsSync(path.join(home, "denied.txt"))).toBe(false);
 		expect(deniedReport.denied).toHaveLength(1);
-		expect(deniedReport.denied[0]!.replace(/\\/g, "/")).toContain("denied.txt");
+		expect(deniedReport.denied[0]!.path.replace(/\\/g, "/")).toContain("denied.txt");
 	});
 
 	it("apply failures are collected per entry and reported (nothing applied)", async () => {
@@ -195,7 +202,7 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 		expect(existsSync(path.join(project, "inside.txt"))).toBe(false);
 		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
 		// The report names what was lost, for the steering warning.
-		const failedPaths = (report.failed?.paths ?? []).map((p) => p.replace(/\\/g, "/"));
+		const failedPaths = (report.failed?.paths ?? []).map((c) => c.path.replace(/\\/g, "/"));
 		expect(failedPaths.some((p) => p.includes("inside.txt"))).toBe(true);
 		expect(failedPaths.some((p) => p.includes("outside.txt"))).toBe(true);
 		// Nothing was "denied" — this was a failure, not a rejection.
@@ -214,7 +221,7 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 
 		expect(report.failed?.error).toContain("ui gone");
 		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
-		expect(report.failed?.paths.some((p) => p.includes("outside.txt"))).toBe(true);
+		expect(report.failed?.paths.some((c) => c.path.includes("outside.txt"))).toBe(true);
 		expect(report.denied).toEqual([]);
 	});
 
@@ -254,5 +261,58 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 		);
 		expect(report).toEqual({ applied: 0, denied: [], failed: null });
 		expect(confirmCalls).toBe(0);
+	});
+});
+
+describe("labelChanges (git status --short codes)", () => {
+	const file = (over: object = {}) => ({
+		path: path.join(home, "f.txt"),
+		nodeType: "file" as const,
+		content: new Uint8Array(),
+		mode: 0o644,
+		mtime: new Date(),
+		...over,
+	});
+
+	it("deletions are D", () => {
+		const labels = labelChanges({ writes: [], deletions: [path.join(home, "gone.txt")] }, () => true);
+		expect(labels).toEqual([{ code: "D", path: path.join(home, "gone.txt") }]);
+	});
+
+	it("file writes are A when the target is absent, M when it exists", () => {
+		const absent = labelChanges({ writes: [file()], deletions: [] }, () => false);
+		expect(absent[0]!.code).toBe("A");
+		const present = labelChanges({ writes: [file()], deletions: [] }, () => true);
+		expect(present[0]!.code).toBe("M");
+	});
+
+	it("metadata-only writes are always M", () => {
+		const labels = labelChanges({ writes: [file({ metadataOnly: true })], deletions: [] }, () => false);
+		expect(labels[0]!.code).toBe("M");
+	});
+
+	it("symlink writes decode the target from content", () => {
+		const target = path.join(home, "real.txt");
+		const link = {
+			path: path.join(home, "link"),
+			nodeType: "symlink" as const,
+			content: new TextEncoder().encode(target),
+			mode: 0o777,
+			mtime: new Date(),
+		};
+		const labels = labelChanges({ writes: [link], deletions: [] }, () => false);
+		expect(labels[0]).toEqual({ code: "A", path: link.path, target });
+	});
+
+	it("a staged directory (not pre-existing — those are filtered earlier) is A", () => {
+		const dir = {
+			path: path.join(home, "newdir"),
+			nodeType: "directory" as const,
+			content: new Uint8Array(),
+			mode: 0o755,
+			mtime: new Date(),
+		};
+		const labels = labelChanges({ writes: [dir], deletions: [] }, () => false);
+		expect(labels[0]!.code).toBe("A");
 	});
 });
