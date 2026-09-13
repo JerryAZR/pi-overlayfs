@@ -7,16 +7,16 @@
  *
  *   - Fail-closed: no localOps. Unresolved commands (npm, node, ...) 127
  *     bash-style in-band inside the sandbox — nothing ever runs natively.
- *   - No merge: registerFork is a no-op, so writes evaporate with the
- *     per-call fork (interim drop-semantics; see the readOnly TODO below).
+ *   - Read-only mounts: writes through an overlay fail loudly with EROFS
+ *     at the write site (just-bash readOnly template option). registerFork
+ *     is a no-op — there is no merge in a read-only child.
  *   - just-git provides git inside the sandbox (no network; pure-mutator
  *     verbs disabled for clean UX errors).
  *
  * The `disabled` git list below is UX only (clean "not available" errors
- * for pure mutators); enforcement is the drop-semantics fork layer.
- * Dual-purpose verbs (branch, tag, stash, config, remote, worktree) stay
- * enabled so their read modes work; their write modes' changes are dropped
- * with the fork.
+ * for pure mutators); enforcement is the EROFS mount layer. Dual-purpose
+ * verbs (branch, tag, stash, config, remote, worktree) stay enabled so
+ * their read modes work; their write modes fail with EROFS.
  */
 
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -51,10 +51,9 @@ const DISABLED_GIT: GitCommandName[] = [
  * command-level failures (touch, rm) as exit codes, but interpreter-level
  * failures — output redirections write through the interpreter's own FS
  * path — REJECT the exec promise with these. Both shapes mean the same
- * thing to the caller: the command failed. When the upstream readOnly mount
- * option lands, its EROFS rejections surface through exactly this path.
- * Anything outside this taxonomy is a genuine interpreter bug and is
- * rethrown, loudly.
+ * thing to the caller: the command failed. The readOnly mounts' EROFS
+ * rejections surface through exactly this path. Anything outside this
+ * taxonomy is a genuine interpreter bug and is rethrown, loudly.
  */
 const FS_ERROR_PATTERN =
 	/^(EROFS|EACCES|EPERM|ENOENT|EFBIG|ENOSPC|EISDIR|ENOTDIR|ELOOP|ENOTEMPTY|EEXIST|EINVAL|EBUSY|EXDEV|EIO)\b/;
@@ -67,12 +66,9 @@ const FS_ERROR_PATTERN =
  * to later python calls.
  */
 export function createReadOnlyTools(options: { cwd: string }): ToolDefinition<any>[] {
-	// TODO: mounts are read-write for now — add `readOnly: true` to each
-	// mount once the just-bash mount option lands upstream (one-line change,
-	// in tool-surface.ts). Until then the no-op registerFork below is the
-	// write barrier: staged writes are dropped with each per-call fork.
 	const surface = createForkedToolSurface({
 		cwd: options.cwd,
+		mountsReadOnly: true,
 		forkBash: ({ template, virtualCwd, virtualHome }) => {
 			const fork = template.fork();
 			const raw = new Bash({
@@ -101,8 +97,8 @@ export function createReadOnlyTools(options: { cwd: string }): ToolDefinition<an
 			};
 			return { bash, fork };
 		},
-		// Read-only children never merge: with read-write mounts this is
-		// interim drop-semantics until the readOnly mount option lands.
+		// No merge exists in a read-only child; with EROFS mounts nothing can
+		// be staged on an overlay anyway (writes fail at the write site).
 		registerFork: () => {},
 		// No localOps: fail-closed — nothing ever runs natively.
 	});

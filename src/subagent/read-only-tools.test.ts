@@ -2,12 +2,9 @@
  * Integration tests for the read-only child tool surface (read-only-tools.ts).
  *
  * These run the real just-bash interpreter (over real VfsTemplate forks on
- * real temp dirs) — the fail-closed routing and the just-git capability
- * layer are the things under test, so mocks would test nothing.
- *
- * TODO: once the upstream readOnly mount option lands, add tests pinning
- * write-denial (EROFS) against the project mount. Until then writes are
- * only dropped (never merged), not denied — there is nothing to pin.
+ * real temp dirs) — the fail-closed routing, EROFS enforcement, and the
+ * just-git capability layer are the things under test, so mocks would
+ * test nothing.
  */
 
 import { execFileSync } from "node:child_process";
@@ -112,6 +109,48 @@ describe("sandboxed bash: /tmp scratch persists across calls", () => {
 		await textOf("echo scratch > /tmp/pi-sandbox-marker.txt");
 		const out = await textOf("cat /tmp/pi-sandbox-marker.txt");
 		expect(out).toMatch(/scratch/);
+	});
+});
+
+describe("read-only enforcement (EROFS)", () => {
+	it("redirects that create files fail; nothing reaches disk", async () => {
+		const msg = await errorOf("echo x > newfile.txt");
+		expect(msg).toMatch(/EROFS|read-only/i);
+		expect(fs.existsSync(path.join(repoDir, "newfile.txt"))).toBe(false);
+	});
+
+	it("redirects that append to existing files fail; content intact", async () => {
+		await errorOf("echo y >> hello.txt");
+		expect(fs.readFileSync(path.join(repoDir, "hello.txt"), "utf8")).toBe("hello world\n");
+	});
+
+	it("rm fails; file intact", async () => {
+		await errorOf("rm hello.txt");
+		expect(fs.readFileSync(path.join(repoDir, "hello.txt"), "utf8")).toBe("hello world\n");
+	});
+
+	it("mkdir fails; directory absent", async () => {
+		await errorOf("mkdir newdir");
+		expect(fs.existsSync(path.join(repoDir, "newdir"))).toBe(false);
+	});
+
+	it("dual-purpose git write modes fail while read modes keep working", async () => {
+		await errorOf("git branch test-branch");
+		const branches = await textOf("git branch");
+		expect(branches).not.toMatch(/test-branch/);
+	});
+
+	it("python writes through the overlay fail too", async () => {
+		const result = await pythonTool.execute(
+			"test",
+			{ code: "open('py-made.txt', 'w').write('x')" },
+			undefined,
+			undefined,
+			undefined as any,
+		);
+		const text = result.content.map((c: any) => c.text).join("");
+		expect(text).toMatch(/Errno|EROFS|read-only|Permission/i);
+		expect(fs.existsSync(path.join(repoDir, "py-made.txt"))).toBe(false);
 	});
 });
 

@@ -53,6 +53,12 @@ export interface ForkedToolSurfaceOptions {
 	registerFork(fork: MountableFs): void;
 	/** Native fallback ops; omit for fail-closed (read-only) sandboxes. */
 	localOps?: BashOperations;
+	/**
+	 * Mount overlays read-only (just-bash readOnly template option): writes
+	 * through an overlay fail with EROFS at the fs layer. Read-only children;
+	 * the main session needs writable (COW) mounts.
+	 */
+	mountsReadOnly?: boolean;
 	/** Extra bash prompt guidelines (main session's mixed-call split rule). */
 	bashGuidelines?: string[];
 }
@@ -77,7 +83,7 @@ export function createForkedToolSurface(options: ForkedToolSurfaceOptions): Fork
 		options.cwd,
 		options.home ?? os.homedir(),
 	);
-	const template = createVfsTemplate({ mounts });
+	const template = createVfsTemplate({ mounts, readOnly: options.mountsReadOnly });
 	const forkCtx: ForkBashContext = { template, virtualCwd, virtualHome };
 	const resolve = mapper.resolveToolPath;
 

@@ -67,14 +67,12 @@ Four tools for spawning in-process subagent sessions (pi SDK `createAgentSession
 **Read-only agents** (`review`/`explore`) run on the same engine as the main session — same mount topology (real-layout home and project mounts), per-call forks, shared `/tmp` scratch — with three deliberate deltas:
 
 - **Fail-closed bash: no native fallback, ever.** Unresolved commands (`npm`, `node`, third-party CLIs) report `command not found` (exit 127) in-band instead of being rerouted to the host — a read-only agent has no host execution capability at all. `git` is provided *inside* the sandbox via [just-git](https://www.npmjs.com/package/just-git) with networking disabled (mutating verbs like `commit`/`checkout`/`reset` are disabled as UX; the fs boundary is the real enforcement).
-- **Nothing is ever merged or applied.** Forks are never registered, so there is no finisher, no confirm, no write path to disk.
+- **Mounts are read-only (EROFS).** Writes through an overlay fail loudly at the write site (just-bash `readOnly` template option). Nothing is ever merged or applied — there is no finisher, no confirm, no write path to disk.
 - **python** is available (same sandboxed CPython, same fs), so read-only agents can write and run temporary analysis scripts in `/tmp`.
 
 **Delegate agents** are plain pi sessions: they load extensions naturally — including this package's overlayfs extension, which gives each delegate its own template and per-`turn_end` finisher (its confirms surface in the parent TUI through a serialized dialog bridge) — and this subagents extension, so delegates can themselves spawn review/explore agents. Recursion is bounded structurally: `delegate` is denied to child sessions (`excludeTools`), and read-only children load no extensions at all, so the chain can never grow past delegate → read-only.
 
 **Lifecycle:** agent ids are `<role>-<n>` and reported in every result footer. `follow_up` resumes the live session (auto-compacting first when context exceeds 50%). Agents idle for more than 10 owning-session turns are disposed by a recency sweep (never while streaming); everything is disposed at session shutdown.
-
-> **Interim state:** read-only mounts are currently read-write forks whose writes are dropped (never registered). A `readOnly` mount option in just-bash will switch enforcement to loud `EROFS` failures at the write site — a one-line change, marked with TODOs in `src/subagent/read-only-tools.ts`.
 
 ## Limitations
 
