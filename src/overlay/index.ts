@@ -21,6 +21,7 @@
 import { existsSync, statSync } from "node:fs";
 import { createLocalBashOperations, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Bash, type MountableFs, type VfsTemplate } from "@jerryan/just-bash";
+import { SPLIT_RULE } from "./exec.js";
 import { applyChangeSetPerEntry, formatLabeledChange, runFinisher } from "./finisher.js";
 import type { PathMapper } from "./paths.js";
 import { createForkedToolSurface } from "./tool-surface.js";
@@ -28,14 +29,14 @@ import { createForkedToolSurface } from "./tool-surface.js";
 /**
  * Proactive form of the mixed-call rule enforced in exec.ts: the model should
  * know BEFORE composing a command that deletion verbs can't ride along with
- * natively-routed dev tools. The error message is the backstop that names
- * the specific violation. Keep the two texts consistent.
+ * natively-routed dev tools. The error message (SPLIT_RULE's other consumer)
+ * is the backstop that names the specific violation.
  */
 const BASH_SPLIT_GUIDELINE =
 	"The bash tool runs file commands (rm, mv, cp, ls, grep, ...) in a sandbox and dev-toolchain commands " +
-	"(git, npm, cargo, node, python, ...) natively on the host. Never combine rm, mv or rmdir with host-run " +
-	"dev tools in a single call - the deletion must be its own separate bash call. Combining rm/mv with " +
-	"other file commands in one call is fine.";
+	"(git, npm, cargo, node, python, ...) natively on the host. " +
+	SPLIT_RULE +
+	" The deletion must be its own separate bash call; combining rm/mv with other file commands in one call is fine.";
 
 interface SessionState {
 	template: VfsTemplate;
@@ -148,7 +149,11 @@ export default function (pi: ExtensionAPI) {
 
 		if (report.failed) {
 			try {
-				ctx.ui.notify(`pi-overlayfs: failed to apply staged changes: ${report.failed.error}`, "error");
+				const headline =
+					report.failed.kind === "confirm"
+						? `confirmation failed; staged changes were discarded: ${report.failed.error}`
+						: `failed to apply staged changes: ${report.failed.error}`;
+				ctx.ui.notify(`pi-overlayfs: ${headline}`, "error");
 			} catch {
 				/* no UI */
 			}
@@ -164,11 +169,11 @@ export default function (pi: ExtensionAPI) {
 					`were rejected and discarded without touching disk:\n${changes.map(formatLabeledChange).join("\n")}`,
 			);
 		}
-		if (report.failed && report.failed.paths.length > 0) {
-			const changes = report.failed.paths;
+		if (report.failed) {
+			const failures = report.failed.failures;
 			sections.push(
-				`${changes.length} staged change${changes.length === 1 ? "" : "s"} could not be written to disk ` +
-					`and were discarded:\n${changes.map(formatLabeledChange).join("\n")}`,
+				`${failures.length} staged change${failures.length === 1 ? "" : "s"} could not be written to disk ` +
+					`and were discarded:\n${failures.map((f) => `${formatLabeledChange(f.change)} — ${f.error}`).join("\n")}`,
 			);
 		}
 		if (sections.length > 0) {

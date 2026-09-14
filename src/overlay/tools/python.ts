@@ -37,7 +37,9 @@ const parameters = Type.Object({
 	cwd: Type.Optional(
 		Type.String({ description: "Working directory (host path or virtual POSIX path). Defaults to the project." }),
 	),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, defaults to 300)" })),
+	timeout: Type.Optional(
+		Type.Number({ description: `Timeout in seconds (optional, defaults to ${DEFAULT_TIMEOUT_SECONDS})` }),
+	),
 });
 
 type PythonParams = {

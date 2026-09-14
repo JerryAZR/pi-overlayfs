@@ -86,8 +86,9 @@ function isWindowsAbsolute(p: string): boolean {
  * the /c/... form natively).
  *   win32: "C:\\Users\\jerry" -> "/c/Users/jerry"  (lowercase drive letter)
  *   posix: "/home/jerry"      -> "/home/jerry"      (identity)
- * UNC paths get separator normalization only (documented edge; such cwds
- * route native anyway).
+ * UNC paths get separator normalization only (documented edge): the UNC
+ * root IS mounted and routed sandboxed like any other root — whether
+ * just-bash handles //server/... mounts correctly is untested upstream.
  */
 export function virtualMountPointFor(hostRoot: string, platform?: Platform): string {
 	const plat = platform ?? (process.platform as Platform);

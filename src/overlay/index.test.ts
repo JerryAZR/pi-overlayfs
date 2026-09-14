@@ -133,10 +133,10 @@ describe("extension wiring (fake pi, real sandbox)", () => {
 		const fake = makeFakePi();
 		await startSession(fake, project);
 		const bashGuidelines = toolByName(fake, "bash").promptGuidelines ?? [];
-		expect(bashGuidelines.some((g) => g.includes("Never combine rm, mv or rmdir"))).toBe(true);
+		expect(bashGuidelines.some((g) => g.includes("rm, mv and rmdir always run in the sandbox"))).toBe(true);
 		for (const name of ["read", "write", "edit", "python"]) {
 			const guidelines = toolByName(fake, name).promptGuidelines ?? [];
-			expect(guidelines.some((g) => g.includes("Never combine rm, mv or rmdir"))).toBe(false);
+			expect(guidelines.some((g) => g.includes("rm, mv and rmdir always run in the sandbox"))).toBe(false);
 		}
 	});
 

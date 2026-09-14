@@ -202,7 +202,7 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 		expect(existsSync(path.join(project, "inside.txt"))).toBe(false);
 		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
 		// The report names what was lost, for the steering warning.
-		const failedPaths = (report.failed?.paths ?? []).map((c) => c.path.replace(/\\/g, "/"));
+		const failedPaths = (report.failed?.failures ?? []).map((f) => f.change.path.replace(/\\/g, "/"));
 		expect(failedPaths.some((p) => p.includes("inside.txt"))).toBe(true);
 		expect(failedPaths.some((p) => p.includes("outside.txt"))).toBe(true);
 		// Nothing was "denied" — this was a failure, not a rejection.
@@ -221,7 +221,8 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 
 		expect(report.failed?.error).toContain("ui gone");
 		expect(existsSync(path.join(home, "outside.txt"))).toBe(false);
-		expect(report.failed?.paths.some((c) => c.path.includes("outside.txt"))).toBe(true);
+		expect(report.failed?.kind).toBe("confirm");
+		expect(report.failed?.failures.some((f) => f.change.path.includes("outside.txt"))).toBe(true);
 		expect(report.denied).toEqual([]);
 	});
 

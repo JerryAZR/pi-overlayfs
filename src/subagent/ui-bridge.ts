@@ -16,6 +16,9 @@
  *   select, confirm, input, editor, custom
  *   Dialog opts (signal, timeout) pass through unchanged, so the child can
  *   abort-dismiss and auto-dismiss exactly as documented.
+ *   Known edge: the process-wide queue has no per-agent cancellation — an
+ *   agent disposed while its dialog is still pending leaves that dialog
+ *   blocking later subagent dialogs until the user answers it.
  *
  * Fire-and-forget (forwarded):
  *   notify        — message prefixed with [label]

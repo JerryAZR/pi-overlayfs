@@ -60,10 +60,11 @@ export interface FinisherReport {
 	/** Outside-project changes DENIED by the user or the headless policy → not applied. */
 	denied: LabeledChange[];
 	/**
-	 * Approved but FAILED to apply (per-entry apply errors, or a confirm
-	 * error). paths names exactly what was lost.
+	 * Approved but FAILED: per-entry apply errors (kind "apply") or a confirm
+	 * that threw (kind "confirm" — the user never answered; nothing was
+	 * applied). failures names exactly what was lost, with per-path errors.
 	 */
-	failed: { error: string; paths: LabeledChange[] } | null;
+	failed: { kind: "apply" | "confirm"; error: string; failures: { change: LabeledChange; error: string }[] } | null;
 }
 
 function isNoOpDirectoryWrite(write: OverlayWrite, isExistingDirectory: (p: string) => boolean): boolean {
@@ -125,7 +126,11 @@ function labelWrite(write: OverlayWrite, pathExists: (p: string) => boolean): La
 	return { code: pathExists(write.path) ? "M" : "A", path: write.path };
 }
 
-/** Git-status-style labels for a change set (A/M/D — see LabeledChange). */
+/** Git-status-style labels for a change set (A/M/D — see LabeledChange).
+ * The A/M verdict is an existence probe at finish time — a TOCTOU by design:
+ * disk can change between diff and apply (native-route calls, the user), and
+ * a dangling symlink probes as absent → "A". Cosmetic only: labels feed
+ * dialogs and reports, never the apply decision. */
 export function labelChanges(changes: OverlayDiff, pathExists: (p: string) => boolean): LabeledChange[] {
 	return [
 		...changes.deletions.map((path): LabeledChange => ({ code: "D", path })),
@@ -158,6 +163,9 @@ export async function applyChangeSetPerEntry(
 	apply: (diff: OverlayDiff) => void | Promise<void> = applyDiffToRealFs,
 ): Promise<ApplyFailure[]> {
 	const failures: ApplyFailure[] = [];
+	// Deepest-first deletions: an ancestor path is always a strictly shorter
+	// string, and whiteouts never nest within one overlay — so string length
+	// is a valid depth proxy (not a hack to "fix").
 	const deletions = [...subset.deletions].sort((a, b) => b.length - a.length);
 	for (const target of deletions) {
 		try {
@@ -183,6 +191,7 @@ export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 
 	const { inside, outside } = partitionChanges(changes, deps.isUnderProject, deps.isExistingDirectory);
 	const failures: ApplyFailure[] = [];
+	let confirmThrew = false;
 	// Labels for every staged path (inside and outside) so reports and the
 	// confirm can all speak in A/M/D. A path staged as both deletion and
 	// write is an odd race survivor; last label wins, the apply decides.
@@ -208,6 +217,7 @@ export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 		}
 
 		if (confirmError !== undefined) {
+			confirmThrew = true;
 			const message = errorMessage(confirmError);
 			failures.push(...realPathsOf(outside).map((p) => ({ path: p, error: message })));
 		} else if (approved) {
@@ -220,7 +230,11 @@ export async function runFinisher(deps: FinisherDeps): Promise<FinisherReport> {
 	}
 
 	if (failures.length > 0) {
-		report.failed = { error: failures[0]!.error, paths: failures.map((f) => labeled(f.path)) };
+		report.failed = {
+			kind: confirmThrew ? "confirm" : "apply",
+			error: failures[0]!.error,
+			failures: failures.map((f) => ({ change: labeled(f.path), error: f.error })),
+		};
 	}
 	return report;
 }

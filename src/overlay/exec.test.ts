@@ -609,7 +609,8 @@ describe("fail-closed mode (no native fallback — read-only agents)", () => {
 		// the miss itself is reported in-band. (The 127 case is pinned by the
 		// runtime-composed test below.)
 		expect(outcome.exitCode).toBe(0);
-		const text = Buffer.concat(chunks).toString();		expect(text).toContain("before");
+		const text = Buffer.concat(chunks).toString();
+		expect(text).toContain("before");
 		expect(text).toContain("after");
 		expect(text).toMatch(/command not found/i);
 	});

@@ -34,12 +34,19 @@ export interface SandboxRunResult {
  */
 const SENSITIVE_COMMANDS = new Set(["rm", "mv", "rmdir"]);
 
+/**
+ * The split rule behind the mixed-call rejection — shared by the rejection
+ * error below and the bash prompt guideline in index.ts (one text, two
+ * consumers; keep them saying the same thing by construction).
+ */
+export const SPLIT_RULE =
+	"rm, mv and rmdir always run in the sandbox, so they cannot share a bash call with commands that run natively on the host";
+
 /** The mixed-call rejection error, shared by the static and runtime paths. */
 function mixedSensitiveError(sensitive: string[], unresolved: string[]): Error {
 	return new Error(
 		`Rejected: this call combines ${sensitive.join(", ")} with host-run commands (${unresolved.join(", ")}). ` +
-			`Rule: rm, mv and rmdir always run in the sandbox, so they cannot share a bash call with commands that run ` +
-			`natively on the host. Split the call: ${sensitive.join(", ")} must run on its own, in a separate bash call from the rest.`,
+			`Rule: ${SPLIT_RULE}. Split the call: ${sensitive.join(", ")} must run on its own, in a separate bash call from the rest.`,
 	);
 }
 
@@ -204,8 +211,10 @@ export interface SandboxBash {
  *
  * Output is returned buffered and NOT emitted on success — the caller emits
  * only once the route is known to stay sandboxed. On timeout/abort the
- * partial output captured so far IS emitted via onData before throwing, so
- * hang diagnostics are not lost (matching native execution, which streams
+ * partial output captured so far IS emitted via onData before throwing —
+ * but only when the underlying exec RESOLVES (e.g. exit 124); a signal-level
+ * exec rejection carries no partial output, so the timeout error may lack
+ * diagnostics on that path (matching native execution, which streams
  * partial output up to the kill).
  */
 export async function runSandboxed(
