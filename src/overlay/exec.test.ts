@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +15,7 @@ import {
 	type BashExecDeps,
 	type SandboxBash,
 } from "./exec.js";
+import { applyChangeSetPerEntry } from "./finisher.js";
 import { createPathMapper, type PathMapper } from "./paths.js";
 
 let tmpRoot: string;
@@ -104,6 +105,31 @@ describe("execBashWithFallback (real vfs template on temp dirs)", () => {
 		expect(chunks[0]).toBeInstanceOf(Buffer);
 		expect(chunks[0]!.toString()).toBe("out\n");
 		expect(chunks[1]!.toString()).toBe("err\n");
+	});
+
+	it("a completed call registers its fork regardless of exit code: staged effects merge at turn_end", async () => {
+		// Parity with the python tool's pin: a non-zero exit is still a
+		// completed call — writes staged before the failure are legitimate
+		// effects and must reach the merge.
+		const registered: MountableFs[] = [];
+		const ops = createOverlayBashOperations({
+			forkBash,
+			registerFork: (fork) => registered.push(fork),
+			mapCwd: (hostCwd) => mapper.hostToVirtual(hostCwd),
+			localOps: {
+				exec: async () => {
+					throw new Error("native route must not be taken");
+				},
+			},
+		});
+
+		const result = await ops.exec("echo staged > staged.txt; exit 3", project, { onData: noOp });
+		expect(result.exitCode).toBe(3);
+		expect(registered).toHaveLength(1);
+
+		const merged = await template.merge(registered);
+		await applyChangeSetPerEntry(merged.diff({ space: "host" }));
+		expect(readFileSync(path.join(project, "staged.txt"), "utf8")).toBe("staged\n");
 	});
 
 	it("falls back to native when static analysis finds unresolved commands", async () => {
@@ -453,6 +479,55 @@ describe("runSandboxed semantics (real vfs template)", () => {
 			}),
 		).rejects.toThrow("timeout:1");
 		expect(Buffer.concat(chunks).toString()).toContain("partial");
+	});
+
+	it("a generic exec error while aborted surfaces as Error('aborted') (injected bash)", async () => {
+		const controller = new AbortController();
+		const fakeBash: SandboxBash = {
+			exec: async () => {
+				controller.abort();
+				throw new Error("shell exploded");
+			},
+			analyzeCommands: async () => ({ commands: [], unresolved: [] }),
+		};
+		await expect(
+			runSandboxed(fakeBash, "whatever", {
+				virtualCwd: "/home/user",
+				onData: noOp,
+				signal: controller.signal,
+			}),
+		).rejects.toThrow(/^aborted$/);
+	});
+
+	it("a generic exec error after the timeout fires surfaces as Error('timeout:<s>') (injected bash)", async () => {
+		const fakeBash: SandboxBash = {
+			exec: (_cmd, opts) =>
+				new Promise((_resolve, reject) => {
+					// The timeout kills the run via the injected signal; the shell
+					// reports it with its own (non-timeout) error.
+					opts?.signal?.addEventListener("abort", () => reject(new Error("killed by shell")));
+				}),
+			analyzeCommands: async () => ({ commands: [], unresolved: [] }),
+		};
+		await expect(
+			runSandboxed(fakeBash, "whatever", {
+				virtualCwd: "/home/user",
+				onData: noOp,
+				timeout: 0.05,
+			}),
+		).rejects.toThrow("timeout:0.05");
+	});
+
+	it("a generic exec error with no abort/timeout propagates unchanged", async () => {
+		const fakeBash: SandboxBash = {
+			exec: async () => {
+				throw new Error("shell exploded");
+			},
+			analyzeCommands: async () => ({ commands: [], unresolved: [] }),
+		};
+		await expect(
+			runSandboxed(fakeBash, "whatever", { virtualCwd: "/home/user", onData: noOp }),
+		).rejects.toThrow("shell exploded");
 	});
 
 	it("throws Error('aborted') when the signal is already aborted", async () => {

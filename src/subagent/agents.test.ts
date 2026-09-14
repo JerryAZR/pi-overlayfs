@@ -17,7 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { AgentManager, PROTECTION_TURNS } from "./agents.js";
+import { AgentManager, PROTECTION_TURNS, ProgressBridge, registerAgentTools } from "./agents.js";
 
 // ---------------------------------------------------------------------------
 // Fake session
@@ -211,6 +211,25 @@ describe("spawn", () => {
 		expect(manager.liveIds()).toEqual([]);
 	});
 
+	it("a session whose messages contain no assistant text yields the '(no output)' result", async () => {
+		const session = fakeSession();
+		session.prompt = async (task: string) => {
+			session.prompts.push(task);
+			// Assistant replied, but with no text content (thinking only).
+			session.messages.push({
+				role: "assistant",
+				content: [{ type: "thinking", thinking: "hmm" }],
+				stopReason: "stop",
+			});
+		};
+		const manager = createManager([session]);
+
+		const result = await manager.spawn({ role: "delegate", task: "x", cwd: os.tmpdir(), ctx: fakeCtx });
+
+		// Not an error — a successful run with nothing to show.
+		expect(text(result)).toBe("(no output)\n\n---\nagent: delegate-1");
+	});
+
 	it("surfaces assistant error stops as thrown errors", async () => {
 		const manager = createManager([fakeSession({ stopReason: "error", errorMessage: "overloaded" })]);
 
@@ -219,6 +238,150 @@ describe("spawn", () => {
 		).rejects.toThrow(/Subagent failed: overloaded/);
 		// The agent is still registered — follow_up is the recovery path.
 		expect(manager.liveIds()).toEqual(["delegate-1"]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Lifecycle wiring (registerAgentTools → pi event subscriptions)
+// ---------------------------------------------------------------------------
+
+describe("lifecycle wiring", () => {
+	function fakePi() {
+		const handlers = new Map<string, () => void>();
+		return {
+			handlers,
+			on(event: string, handler: () => void) {
+				handlers.set(event, handler);
+			},
+			registerTool() {},
+		};
+	}
+
+	it("subscribes turn_end → noteTurnEnd and session_shutdown → disposeAll", async () => {
+		const pi = fakePi();
+		const manager = createManager();
+		registerAgentTools(pi as any, manager);
+		expect(pi.handlers.has("turn_end")).toBe(true);
+		expect(pi.handlers.has("session_shutdown")).toBe(true);
+
+		await manager.spawn({ role: "delegate", task: "x", cwd: os.tmpdir(), ctx: fakeCtx });
+		// turn_end drives the recency sweep: the idle agent survives exactly
+		// PROTECTION_TURNS ends and is evicted by the next one.
+		for (let i = 0; i < PROTECTION_TURNS; i++) pi.handlers.get("turn_end")!();
+		expect(manager.liveIds()).toEqual(["delegate-1"]);
+		pi.handlers.get("turn_end")!();
+		expect(manager.liveIds()).toEqual([]);
+
+		// session_shutdown disposes every live agent.
+		await manager.spawn({ role: "delegate", task: "y", cwd: os.tmpdir(), ctx: fakeCtx });
+		expect(manager.liveIds()).toEqual(["delegate-2"]);
+		pi.handlers.get("session_shutdown")!();
+		expect(manager.liveIds()).toEqual([]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// ProgressBridge — session events → tool progress updates
+// ---------------------------------------------------------------------------
+
+const textDelta = (delta: string) => ({
+	type: "message_update",
+	assistantMessageEvent: { type: "text_delta", delta },
+});
+const thinkingDelta = (delta: string) => ({
+	type: "message_update",
+	assistantMessageEvent: { type: "thinking_delta", delta },
+});
+const messageEnd = (usage?: { input: number; output: number }, role = "assistant") => ({
+	type: "message_end",
+	message: { role, usage },
+});
+/** Let the bridge's trailing throttle (200ms) fire the final update. */
+const settle = () => new Promise((r) => setTimeout(r, 250));
+
+describe("ProgressBridge", () => {
+	it("accumulates text/thinking deltas into previous-turns text and tracks usage", async () => {
+		const bridge = new ProgressBridge();
+		const updates: any[] = [];
+		bridge.reset((r) => updates.push(r));
+
+		bridge.handle(textDelta("hello"));
+		bridge.handle(thinkingDelta("+think"));
+		bridge.handle(messageEnd({ input: 10, output: 5 }));
+		bridge.handle(textDelta("world"));
+		// A non-assistant message_end is ignored: no turn, no tokens.
+		bridge.handle(messageEnd({ input: 99, output: 99 }, "user"));
+		bridge.handle(messageEnd({ input: 3, output: 2 }));
+		await settle();
+
+		const usage = bridge.usage();
+		expect(usage.turns).toBe(2);
+		expect(usage.input).toBe(13);
+		expect(usage.output).toBe(7);
+		// Deltas concatenate raw within a turn; turns join with "\n".
+		expect(updates.at(-1).content[0].text).toBe("hello+think\nworld");
+	});
+
+	it("caps previous-turns text at MAX_PREV_LINES lines (20) — unbounded growth here is a memory leak", async () => {
+		const bridge = new ProgressBridge();
+		const updates: any[] = [];
+		bridge.reset((r) => updates.push(r));
+
+		for (let i = 0; i < 30; i++) {
+			bridge.handle(textDelta(`line-${i}`));
+			bridge.handle(messageEnd());
+		}
+		await settle();
+
+		const lines = updates.at(-1).content[0].text.split("\n");
+		expect(lines.length).toBeLessThanOrEqual(20);
+		expect(lines.at(-1)).toBe("line-29");
+		expect(lines).not.toContain("line-0"); // oldest evicted
+	});
+
+	it("tool_execution_start contributes a one-line summary to the progress text", async () => {
+		const bridge = new ProgressBridge();
+		const updates: any[] = [];
+		bridge.reset((r) => updates.push(r));
+
+		bridge.handle({ type: "tool_execution_start", toolName: "bash", args: { command: "ls" } });
+		await settle();
+
+		expect(updates.at(-1).content[0].text).toContain("bash");
+		expect(updates.at(-1).content[0].text).toContain("command=ls");
+	});
+
+	it("reset() clears text, usage, and the pending throttle; a bare reset drops the update sink", async () => {
+		const bridge = new ProgressBridge();
+		const first: any[] = [];
+		bridge.reset((r) => first.push(r));
+		bridge.handle(textDelta("old"));
+		bridge.handle(messageEnd({ input: 10, output: 5 }));
+
+		const second: any[] = [];
+		bridge.reset((r) => second.push(r));
+		expect(bridge.usage()).toMatchObject({ turns: 0, input: 0, output: 0 });
+
+		bridge.handle(textDelta("fresh"));
+		bridge.handle(messageEnd());
+		await settle();
+
+		// No stale text carries over…
+		expect(second.at(-1).content[0].text).toBe("fresh");
+		// …and the cancelled trailing throttle never fires into the OLD sink.
+		const firstCount = first.length;
+		await settle();
+		expect(first.length).toBe(firstCount);
+
+		// A bare reset() drops the sink entirely: events are tracked but
+		// nothing is emitted.
+		bridge.reset();
+		second.length = 0;
+		bridge.handle(textDelta("silent"));
+		bridge.handle(messageEnd({ input: 1, output: 1 }));
+		await settle();
+		expect(second).toHaveLength(0);
+		expect(bridge.usage()).toMatchObject({ turns: 1, input: 1, output: 1 });
 	});
 });
 

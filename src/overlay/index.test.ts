@@ -311,6 +311,22 @@ describe("extension wiring (fake pi, real sandbox)", () => {
 		expect(readFileSync(path.join(project, "linked.txt"), "utf8")).toBe("x\n");
 	});
 
+	it("session_shutdown clears session state: staged changes are discarded and a later turn_end is a no-op", async () => {
+		const fake = makeFakePi();
+		const ctx = await startSession(fake, project);
+		expect(fake.handlers.has("session_shutdown")).toBe(true);
+		const write = toolByName(fake, "write");
+
+		const target = path.join(project, "shutdown.txt");
+		await write.execute("call-1", { path: target, content: "x\n" }, undefined, undefined);
+		await fake.handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
+
+		// turn_end after shutdown must not apply the staged write, warn, or crash.
+		await turnEnd(fake, ctx);
+		expect(existsSync(target)).toBe(false);
+		expect(fake.messages).toHaveLength(0);
+	});
+
 	it("headless finisher drops outside-project changes unless PI_OVERLAYFS_OUTSIDE_PROJECT=approve", async () => {
 		const fake = makeFakePi();
 		const ctx = await startSession(fake, project);

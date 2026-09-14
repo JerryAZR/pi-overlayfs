@@ -164,6 +164,42 @@ describe("runFinisher (real vfs template on temp dirs)", () => {
 		expect(report.applied).toBe(1);
 	});
 
+	it("an outside-project DELETION flows through the confirm and applies on approval", async () => {
+		await writeFile(path.join(home, "victim.txt"), "x\n");
+		await stage("rm ../victim.txt");
+		const confirmed: { code: string; path: string }[][] = [];
+		const report = await runFinisher(
+			makeDeps(await mergedHostDiff(), {
+				confirm: async (changes) => (
+					confirmed.push(changes.map((c) => ({ code: c.code, path: c.path }))), true
+				),
+			}),
+		);
+
+		expect(confirmed).toEqual([[{ code: "D", path: path.join(home, "victim.txt") }]]);
+		expect(existsSync(path.join(home, "victim.txt"))).toBe(false);
+		expect(report.applied).toBe(1);
+		expect(report.failed).toBeNull();
+	});
+
+	it("a staged NEW directory outside the project reaches the confirm set (not filtered as a dir-chain no-op)", async () => {
+		// Only directory entries that already exist on disk are mkdir -p
+		// no-ops; a genuinely new dir must be confirmed (and applied) itself.
+		await stage("mkdir ../newdir && echo x > ../newdir/file.txt");
+		const confirmedPaths: string[][] = [];
+		const report = await runFinisher(
+			makeDeps(await mergedHostDiff(), {
+				confirm: async (changes) => (confirmedPaths.push(changes.map((c) => c.path)), true),
+			}),
+		);
+
+		expect(confirmedPaths).toHaveLength(1);
+		expect(confirmedPaths[0]).toContain(path.join(home, "newdir"));
+		expect(confirmedPaths[0]).toContain(path.join(home, "newdir", "file.txt"));
+		expect(report.failed).toBeNull();
+		expect(readFileSync(path.join(home, "newdir", "file.txt"), "utf8")).toBe("x\n");
+	});
+
 	it("denied outside-project changes are simply not applied", async () => {
 		await stage("echo secret > ../outside.txt");
 		const report = await runFinisher(makeDeps(await mergedHostDiff(), { confirm: async () => false }));

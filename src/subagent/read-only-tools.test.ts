@@ -16,6 +16,17 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import { createReadOnlyTools } from "./read-only-tools.js";
 
+// The fixture repository needs a real git binary on PATH; without it the
+// whole suite skips instead of failing in beforeAll.
+const hasGit = (() => {
+	try {
+		execFileSync("git", ["--version"], { stdio: "pipe" });
+		return true;
+	} catch {
+		return false;
+	}
+})();
+
 let repoDir: string;
 let tools: ToolDefinition<any>[];
 let bashTool: ToolDefinition<any>;
@@ -45,6 +56,7 @@ async function errorOf(command: string) {
 }
 
 beforeAll(() => {
+	if (!hasGit) return;
 	// Requires a real git binary on PATH to build the fixture repository.
 	repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-sandbox-"));
 	fs.writeFileSync(path.join(repoDir, "hello.txt"), "hello world\n");
@@ -64,16 +76,17 @@ beforeAll(() => {
 });
 
 afterAll(() => {
+	if (!repoDir) return;
 	fs.rmSync(repoDir, { recursive: true, force: true });
 });
 
-describe("tool surface", () => {
+describe.skipIf(!hasGit)("tool surface", () => {
 	it("returns the sandboxed bash and python tools", () => {
 		expect(tools.map((t) => t.name).sort()).toEqual(["bash", "python", "read"]);
 	});
 });
 
-describe("sandboxed bash: basic execution", () => {
+describe.skipIf(!hasGit)("sandboxed bash: basic execution", () => {
 	it("runs pipelines with cwd at the project root", async () => {
 		const out = await textOf("cat hello.txt | grep -n world");
 		expect(out).toMatch(/1:hello world/);
@@ -90,7 +103,7 @@ describe("sandboxed bash: basic execution", () => {
 	});
 });
 
-describe("sandboxed bash: fail-closed routing", () => {
+describe.skipIf(!hasGit)("sandboxed bash: fail-closed routing", () => {
 	it("host dev tools 127 in-band — nothing runs natively", async () => {
 		const msg = await errorOf("npm --version");
 		expect(msg).toMatch(/Command exited with code 127/);
@@ -104,7 +117,7 @@ describe("sandboxed bash: fail-closed routing", () => {
 	});
 });
 
-describe("sandboxed bash: /tmp scratch persists across calls", () => {
+describe.skipIf(!hasGit)("sandboxed bash: /tmp scratch persists across calls", () => {
 	it("a file written via bash is visible to a later call (shared template scratch)", async () => {
 		await textOf("echo scratch > /tmp/pi-sandbox-marker.txt");
 		const out = await textOf("cat /tmp/pi-sandbox-marker.txt");
@@ -112,7 +125,7 @@ describe("sandboxed bash: /tmp scratch persists across calls", () => {
 	});
 });
 
-describe("read-only enforcement (EROFS)", () => {
+describe.skipIf(!hasGit)("read-only enforcement (EROFS)", () => {
 	it("redirects that create files fail; nothing reaches disk", async () => {
 		const msg = await errorOf("echo x > newfile.txt");
 		expect(msg).toMatch(/EROFS|read-only/i);
@@ -137,6 +150,8 @@ describe("read-only enforcement (EROFS)", () => {
 	it("the home mount is read-only too", async () => {
 		const msg = await errorOf("echo x > ~/probe-should-fail.txt");
 		expect(msg).toMatch(/EROFS|read-only/i);
+		// …and nothing leaked onto the real home directory.
+		expect(fs.existsSync(path.join(os.homedir(), "probe-should-fail.txt"))).toBe(false);
 	});
 
 	it("dual-purpose git write modes fail while read modes keep working", async () => {
@@ -159,7 +174,7 @@ describe("read-only enforcement (EROFS)", () => {
 	});
 });
 
-describe("sandboxed bash: git", () => {
+describe.skipIf(!hasGit)("sandboxed bash: git", () => {
 	it("read-only git commands work (just-git against the mounted repo)", async () => {
 		const log = await textOf("git log --oneline");
 		expect(log).toMatch(/initial/);
@@ -181,7 +196,7 @@ describe("sandboxed bash: git", () => {
 	});
 });
 
-describe("python tool", () => {
+describe.skipIf(!hasGit)("python tool", () => {
 	it("executes stdlib code in the sandbox", async () => {
 		const result = await pythonTool.execute(
 			"test",
