@@ -254,6 +254,90 @@ describe("followUp", () => {
 			/No live agents/,
 		);
 	});
+
+	// pi executes same-batch tool calls in parallel; two follow_ups on one
+	// agent must serialize through the entry's run chain, not race the
+	// session (the SDK would throw "Agent is already processing").
+	it("concurrent follow_ups on the same agent serialize through the run chain", async () => {
+		const session = fakeSession();
+		const manager = createManager([session]);
+		await manager.spawn({ role: "delegate", task: "first", cwd: os.tmpdir(), ctx: fakeCtx });
+
+		const order: string[] = [];
+		let release!: () => void;
+		const respond = (task: string) => {
+			session.messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: `done: ${task}` }],
+				stopReason: "stop",
+			});
+		};
+		session.prompt = (task: string) => {
+			session.prompts.push(task);
+			order.push(`start:${task}`);
+			if (task === "second") {
+				return new Promise<void>((resolve) => {
+					release = () => {
+						order.push(`end:${task}`);
+						respond(task);
+						resolve();
+					};
+				});
+			}
+			order.push(`end:${task}`);
+			respond(task);
+			return Promise.resolve();
+		};
+
+		const p1 = manager.followUp({ agent: "delegate-1", task: "second" });
+		const p2 = manager.followUp({ agent: "delegate-1", task: "third" });
+		await new Promise((r) => setImmediate(r));
+		// The second follow-up is queued behind the first: not started yet.
+		expect(order).toEqual(["start:second"]);
+		release();
+		await Promise.all([p1, p2]);
+		expect(order).toEqual(["start:second", "end:second", "start:third", "end:third"]);
+		expect(session.prompts).toEqual(["first", "second", "third"]);
+	});
+
+	it("a follow-up aborted while queued behind another run never prompts", async () => {
+		const session = fakeSession();
+		const manager = createManager([session]);
+		await manager.spawn({ role: "delegate", task: "first", cwd: os.tmpdir(), ctx: fakeCtx });
+
+		let release!: () => void;
+		session.prompt = (task: string) => {
+			session.prompts.push(task);
+			if (task === "second") {
+				return new Promise<void>((resolve) => {
+					release = () => {
+						session.messages.push({
+							role: "assistant",
+							content: [{ type: "text", text: "done" }],
+							stopReason: "stop",
+						});
+						resolve();
+					};
+				});
+			}
+			session.messages.push({
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+				stopReason: "stop",
+			});
+			return Promise.resolve();
+		};
+
+		const p1 = manager.followUp({ agent: "delegate-1", task: "second" });
+		const controller = new AbortController();
+		const p2 = manager.followUp({ agent: "delegate-1", task: "third", signal: controller.signal });
+		await new Promise((r) => setImmediate(r));
+		controller.abort();
+		release();
+		await p1;
+		await expect(p2).rejects.toThrow(/delegate-1 was aborted/);
+		expect(session.prompts).toEqual(["first", "second"]);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -317,7 +401,7 @@ describe("follow-up compaction", () => {
 		const manager = createManager([session]);
 		await spawnFirst(manager, session);
 		await expect(manager.followUp({ agent: "delegate-1", task: "second" })).rejects.toThrow(
-			/Follow-up compaction failed: 429 Too Many Requests/,
+			/Follow-up compaction on delegate-1 failed: 429 Too Many Requests/,
 		);
 		expect(session.prompts).toEqual(["first"]);
 	});

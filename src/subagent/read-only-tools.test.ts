@@ -69,7 +69,7 @@ afterAll(() => {
 
 describe("tool surface", () => {
 	it("returns the sandboxed bash and python tools", () => {
-		expect(tools.map((t) => t.name).sort()).toEqual(["bash", "python"]);
+		expect(tools.map((t) => t.name).sort()).toEqual(["bash", "python", "read"]);
 	});
 });
 

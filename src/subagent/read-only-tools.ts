@@ -1,6 +1,7 @@
 /**
- * Read-only tool surface (bash + python) for review/explore child sessions —
- * the ro preset of the shared forked tool surface (src/overlay/tool-surface.ts).
+ * Read-only tool surface (read + bash + python) for review/explore child
+ * sessions — the ro preset of the shared forked tool surface
+ * (src/overlay/tool-surface.ts).
  *
  * Same engine as the main session: one VfsTemplate per child, a fresh
  * copy-on-write fork per call, same mount topology. The ro knobs:
@@ -103,5 +104,5 @@ export function createReadOnlyTools(options: { cwd: string }): ToolDefinition<an
 		// No localOps: fail-closed — nothing ever runs natively.
 	});
 
-	return [surface.tools.bash, surface.tools.python];
+	return [surface.tools.read, surface.tools.bash, surface.tools.python];
 }

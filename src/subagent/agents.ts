@@ -221,6 +221,13 @@ export interface AgentEntry {
 	session: AgentSession;
 	bridge: ProgressBridge;
 	lastActiveTurn: number;
+	/**
+	 * Per-agent run mutex: runs on this entry serialize through the chain.
+	 * pi executes same-batch tool calls in parallel, so two follow_ups on one
+	 * agent would otherwise race (bridge clobber, "Agent is already
+	 * processing" from the SDK). Cross-agent parallelism is unaffected.
+	 */
+	runChain: Promise<void>;
 }
 
 export interface SpawnAgentOptions {
@@ -533,11 +540,12 @@ export class AgentManager {
 			session,
 			bridge: new ProgressBridge(),
 			lastActiveTurn: this.turn,
+			runChain: Promise.resolve(),
 		};
 		session.subscribe((event) => entry.bridge.handle(event));
 		this.entries.set(id, entry);
 
-		return this.run(entry, opts.task, opts.signal, opts.onUpdate);
+		return this.runSerialized(entry, () => this.run(entry, opts.task, opts.signal, opts.onUpdate));
 	}
 
 	// -------------------------------------------------------------------------
@@ -554,8 +562,24 @@ export class AgentManager {
 			);
 		}
 		assertNotAborted(opts.signal);
-		await this.compactIfNeeded(entry);
-		return this.run(entry, opts.task, opts.signal, opts.onUpdate);
+		return this.runSerialized(entry, async () => {
+			await this.compactIfNeeded(entry);
+			return this.run(entry, opts.task, opts.signal, opts.onUpdate);
+		});
+	}
+
+	/**
+	 * Serialize work on one agent through its run chain: the thunk runs after
+	 * the previous run settles (success or failure). The abort check inside
+	 * run() fires for a signal aborted while queued, before the run starts.
+	 */
+	private runSerialized<T>(entry: AgentEntry, thunk: () => Promise<T>): Promise<T> {
+		const result = entry.runChain.then(() => thunk());
+		entry.runChain = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
 	}
 
 	/**
@@ -574,7 +598,7 @@ export class AgentManager {
 			await entry.session.compact();
 		} catch (err: any) {
 			if (!isBenignCompactionFailure(err)) {
-				fail(`Follow-up compaction failed: ${err.message || String(err)}`);
+				fail(`Follow-up compaction on ${entry.id} failed: ${err.message || String(err)}`);
 			}
 			// Benign failure: nothing to compact by the session's own policy, or
 			// compaction was refused — proceed with the follow-up as-is.
@@ -598,13 +622,13 @@ export class AgentManager {
 		const onAbort = () => {
 			void entry.session.abort();
 		};
-		assertNotAborted(signal);
+		if (signal?.aborted) fail(`Subagent ${entry.id} was aborted`);
 		if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
 		try {
 			await entry.session.prompt(task, { expandPromptTemplates: false });
 		} catch (err: any) {
-			fail(`Subagent failed: ${err.message || String(err)}`);
+			fail(`Subagent ${entry.id} failed: ${err.message || String(err)}`);
 		} finally {
 			if (signal) signal.removeEventListener("abort", onAbort);
 		}
@@ -634,12 +658,14 @@ export interface ChildExtensionFilterOptions {
  * Filter the discovered extension set for a delegate child session.
  * Pure and exported for tests.
  *
- * One exclusion: project-local extensions when the project is untrusted —
- * mirrors pi's trust model, which the raw SDK path does not enforce. Our own
- * package's extensions are deliberately KEPT: the overlayfs extension
- * provides the child's fs isolation and this extension provides
- * review/explore/follow_up for grandchildren (delegate itself is denied via
- * excludeTools — that, not discovery filtering, is the recursion guard).
+ * One exclusion: project-local extensions when the project is untrusted.
+ * The SDK's own discovery already gates project extensions on trust; this
+ * filter is defense-in-depth for explicitly-listed extension paths that
+ * bypass scope discovery. Our own package's extensions are deliberately
+ * KEPT: the overlayfs extension provides the child's fs isolation and this
+ * extension provides review/explore/follow_up for grandchildren (delegate
+ * itself is denied via excludeTools — that, not discovery filtering, is
+ * the recursion guard).
  */
 export function filterChildExtensions<T extends { path: string; resolvedPath?: string }>(
 	extensions: T[],
@@ -709,10 +735,16 @@ async function defaultSpawnSession(
 		settingsManager,
 	});
 
-	await session.bindExtensions({
-		uiContext: createUIBridge(opts.ctx.ui, { label: id }),
-		mode: "rpc",
-	});
+	try {
+		await session.bindExtensions({
+			uiContext: createUIBridge(opts.ctx.ui, { label: id }),
+			mode: "rpc",
+		});
+	} catch (error) {
+		// A half-spawned session is registered nowhere — dispose it ourselves.
+		session.dispose();
+		throw error;
+	}
 
 	return session;
 }

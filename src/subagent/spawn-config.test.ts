@@ -90,7 +90,7 @@ describe("reader roles (review, explore)", () => {
 			expect(
 				options.customTools.map((t: any) => t.name).sort(),
 				role,
-			).toEqual(["bash", "python"]);
+			).toEqual(["bash", "python", "read"]);
 			// No extensions, in-memory session.
 			expect(loader.noExtensions, role).toBe(true);
 			expect(loader.extensionsOverride, role).toBeUndefined();
