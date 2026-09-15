@@ -27,7 +27,7 @@
 		"test": "vitest run"
 	},
 	"dependencies": {
-		"@jerryan/just-bash": "^3.9.0",
+		"@jerryan/just-bash": "^3.10.0",
 		"just-git": "^1.8.0"
 	},
 	"peerDependencies": {

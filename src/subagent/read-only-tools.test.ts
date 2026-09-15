@@ -137,6 +137,25 @@ describe.skipIf(!hasGit)("read-only enforcement (EROFS)", () => {
 		expect(fs.readFileSync(path.join(repoDir, "hello.txt"), "utf8")).toBe("hello world\n");
 	});
 
+	// just-bash 3.10: redirect EROFS is a per-command failure with bash ;
+	// semantics — the list continues, prior/later output is preserved.
+	// (Dogfooded finding: it used to reject the whole exec and discard
+	// everything.)
+	it("a failing redirect fails one command, not the whole call", async () => {
+		const out = await textOf("echo x > locked.txt; echo exit=$?; cat hello.txt");
+		expect(out).toMatch(/exit=1/);
+		expect(out).toMatch(/hello world/);
+		expect(fs.existsSync(path.join(repoDir, "locked.txt"))).toBe(false);
+	});
+
+	// just-bash 3.10: native Windows drive paths translate to the real-layout
+	// virtual form (Git Bash convention), so host-spelling paths work in the
+	// sandbox too.
+	it.runIf(process.platform === "win32")("host-style drive paths resolve inside the sandbox", async () => {
+		const out = await textOf(`cat '${path.join(repoDir, "hello.txt")}'`);
+		expect(out).toMatch(/hello world/);
+	});
+
 	it("rm fails; file intact", async () => {
 		await errorOf("rm hello.txt");
 		expect(fs.readFileSync(path.join(repoDir, "hello.txt"), "utf8")).toBe("hello world\n");
