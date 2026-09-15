@@ -3,6 +3,9 @@
 	"version": "0.1.0",
 	"description": "Route pi's file-touching tools through copy-on-write filesystem forks, and spawn subagents on the same execution model",
 	"license": "MIT",
+	"publishConfig": {
+		"registry": "https://registry.npmjs.org"
+	},
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/JerryAZR/pi-overlayfs.git"
