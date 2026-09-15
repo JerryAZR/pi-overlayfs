@@ -33,9 +33,9 @@ Because execution is structurally sandboxed, a model mistake like `rm -rf ~/impo
 
 ## ⚠️ Native fallback amplifies command scope
 
-When a command references a program the sandbox cannot resolve (`git`, `npm`, `node`, pip-installed CLIs, ...), the **entire command line runs natively on the host without isolation** — including any destructive file operations in the same compound command. `rm -rf node_modules && npm install` is *not* sandboxed: the `rm -rf` executes directly against your real disk, because the sandbox cannot split a shell command line across two execution engines.
+When a command references a program the sandbox cannot resolve (`git`, `npm`, `node`, pip-installed CLIs, ...), the **entire command line runs natively on the host without isolation** — including any file operations in the same compound command. `python gen.py > ~/notes.md` is *not* sandboxed: the redirect writes directly to your real disk, because the sandbox cannot split a shell command line across two execution engines.
 
-Keep that in mind yourself when reviewing what the agent runs: single-purpose sandbox commands (`rm -rf node_modules` alone) are staged and reviewable; the same operation glued to an unresolved program with `&&`/`;` is not.
+The one exception is deletions: the mixed-call gate (above) rejects `rm`/`mv`/`rmdir` glued to natively-routed commands, so a careless `rm -rf scratch && npm install` never executes — the model is told to run the deletion as its own sandboxed call, where it is staged and gated. **Every other write operation on the native route is ungated by design** — redirects, `cp`, `tar`, `chmod` glued to an unresolved program run on the host with no staging and no confirm. Keep that in mind yourself when reviewing what the agent runs: the gate covers deletion verbs; the rest of a native-routed command is trusted.
 
 The sandbox detects unresolved commands twice: statically before execution (the whole command goes native untouched), and at runtime via just-bash's fail-fast abort (exit 127). On the runtime path the already-executed prefix may have staged writes in its fork; that fork is **never registered for the merge**, so no stale staged content can be applied over the native rerun's newer results, and the aborted attempt's output is never shown twice.
 
