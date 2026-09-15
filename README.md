@@ -18,11 +18,11 @@ The built-in replacements are intentional name overrides. If another extension r
 
 ## What it does
 
-- The real home directory is mounted copy-on-write at its **real-layout virtual path**: on POSIX that's the identical path (`/home/jerry` → `/home/jerry`); on Windows it's the MSYS form (`C:\Users\Jerry` → `/c/Users/Jerry`). The project directory is either a subpath of the home mount (when it lives inside home) or its own mount, also at its real-layout path. Because pi's native route always runs through an MSYS-family bash on Windows (and the real shell on POSIX), **one path form is understood by both the sandbox and native commands** — sandboxed `pwd` output can be pasted into a native command unchanged. `/tmp` is shared scratch memory (in-sandbox only; native commands see the host temp dir instead).
+- The real home directory is mounted copy-on-write at its **real-layout virtual path**: on POSIX that's the identical path (`/home/jerry` → `/home/jerry`); on Windows it's the MSYS form (`C:\Users\Jerry` → `/c/Users/Jerry`). The project directory is either a subpath of the home mount (when it lives inside home) or its own mount, also at its real-layout path. Because pi's native route always runs through an MSYS-family bash on Windows (and the real shell on POSIX), **one path form is understood by both the sandbox and native commands** — sandboxed `pwd` output can be pasted into a native command unchanged, and native-spelling `C:\...` paths typed into a sandboxed command are translated to the virtual form (just-bash ≥ 3.10). `/tmp` is shared scratch memory (in-sandbox only; native commands see the host temp dir instead).
 - **Every tool call gets a fresh COW fork.** Writes land in the call's private memory layer and never touch disk directly; calls never see each other's uncommitted writes (fork(2) semantics — `/tmp` is the shared channel). Calls run fully concurrently: isolation comes from the topology, not from locking.
 - Once per turn — at `turn_end`, after **all** tool calls in the batch have completed (pi awaits every execution before emitting it, and awaits the finisher before the next LLM call) — the turn's forks are **merged** into one change set (deterministic: later `changedAt` wins conflicts, ties by completion order) and a finisher applies it to disk:
   - **Inside the project root** — auto-approved, applied immediately.
-  - **Outside the project root** — one `ctx.ui.confirm` dialog per turn listing the affected paths. Approved paths are applied; denied paths are discarded (they never existed as far as disk is concerned).
+  - **Outside the project root** — one `ctx.ui.confirm` dialog per turn listing each staged change with a git-style code (`A` new, `M` modified, `D` deleted; symlinks show their target). Approved changes are applied; denied ones are discarded (they never existed as far as disk is concerned).
   - **Headless** (no UI) — outside-project changes are discarded unless `PI_OVERLAYFS_OUTSIDE_PROJECT=approve` is set.
   - **Discarded changes are never silent** — the model gets a steering message before its next LLM call listing exactly which paths were dropped (whether rejected by the user/policy or lost to an apply failure), so it doesn't believe its writes persisted. Tool results themselves are left untouched (a write that succeeded in its fork is reported honestly as success).
 - Commands that the sandbox cannot resolve (e.g. `git`, `npm`, `node`) fall back to native host execution automatically (static pre-flight analysis first, runtime exit-127 fallback second). Commands the analyzer cannot parse at all (e.g. Windows cmd-style `%VAR%`/`2>nul` syntax) and commands whose cwd maps to no overlay also run natively.
@@ -59,7 +59,7 @@ Exactly one of `code` / `path` is required. Paths may be host paths inside the p
 Tool operations receive absolute paths (pi resolves relative paths against the host session cwd). The adapter maps them to virtual paths:
 
 1. **Host mapping first** — a path under a mount root (real home or project dir) maps onto that root's real-layout mount point (`C:\Users\Jerry\x` → `/c/Users/Jerry/x`; `/home/jerry/x` → `/home/jerry/x`).
-2. **Already-virtual POSIX passthrough** — a path starting with `/` that is under no mount root is used as-is (`/tmp/...`, or an MSYS-form `/c/...` the model typed). On POSIX hosts this means genuine host paths outside home/project (e.g. `/etc/...`) are seen as virtual: reads fail with ENOENT, writes land in throwaway memory.
+2. **Already-virtual POSIX passthrough** — a path starting with `/` that is under no mount root is used as-is (`/tmp/...`, or an MSYS-form `/c/...` the model typed). On POSIX hosts this means genuine host paths outside home/project (e.g. `/etc/...`) are seen as virtual: reads fail with ENOENT, and writes land in the session's shared scratch — same as `/tmp`: visible to later calls for the rest of the session, never applied to disk, gone at session end.
 3. **Windows drive-rooted fallback** — a drive-rooted path under no mount root (`C:\tmp\x`) maps to its real-layout virtual form (`/c/tmp/x`). pi's host-side `resolve()` roots both model-typed POSIX paths (`/tmp/x`) and MSYS paths (`/c/tmp/x`) at the session drive, and this rule maps both spellings to the same virtual path.
 
 ## Subagent tools
@@ -73,15 +73,16 @@ Four tools for spawning in-process subagent sessions (pi SDK `createAgentSession
 | `explore` | read-only | Mapping an unfamiliar project (any `cwd`) |
 | `follow_up` | — | Continue a live subagent's session with full context (`agent` id + new task) |
 
-**Read-only agents** (`review`/`explore`) run on the same engine as the main session — same mount topology (real-layout home and project mounts), per-call forks, shared `/tmp` scratch — with three deliberate deltas:
+**Read-only agents** (`review`/`explore`) run on the same engine as the main session — same mount topology (real-layout home and project mounts), per-call forks, shared `/tmp` scratch — with these deliberate deltas:
 
 - **Fail-closed bash: no native fallback, ever.** Unresolved commands (`npm`, `node`, third-party CLIs) report `command not found` (exit 127) in-band instead of being rerouted to the host — a read-only agent has no host execution capability at all. `git` is provided *inside* the sandbox via [just-git](https://www.npmjs.com/package/just-git) with networking disabled (mutating verbs like `commit`/`checkout`/`reset` are disabled as UX; the fs boundary is the real enforcement).
 - **Mounts are read-only (EROFS).** Writes through an overlay fail loudly at the write site (just-bash `readOnly` template option). Nothing is ever merged or applied — there is no finisher, no confirm, no write path to disk.
+- **The whole surface comes from the sandbox.** Their `read` is the overlay read tool (fresh fork per call, live disk reads, mount-confined like `bash cat`) — pi's unconstrained native read/write/edit never enter reader sessions.
 - **python** is available (same sandboxed CPython, same fs), so read-only agents can write and run temporary analysis scripts in `/tmp`.
 
 **Delegate agents** are plain pi sessions: they load extensions naturally — including this package's overlayfs extension, which gives each delegate its own template and per-`turn_end` finisher (its confirms surface in the parent TUI through a serialized dialog bridge) — and this subagents extension, so delegates can themselves spawn review/explore agents. Recursion is bounded structurally: `delegate` is denied to child sessions (`excludeTools`), and read-only children load no extensions at all, so the chain can never grow past delegate → read-only.
 
-**Lifecycle:** agent ids are `<role>-<n>` and reported in every result footer. `follow_up` resumes the live session (auto-compacting first when context exceeds 50%). Agents idle for more than 10 owning-session turns are disposed by a recency sweep (never while streaming); everything is disposed at session shutdown.
+**Lifecycle:** agent ids are `<role>-<n>` and reported in every result footer. `follow_up` resumes the live session (auto-compacting first when context exceeds 50%); concurrent `follow_up`s on the same agent serialize through a per-agent run chain (parallel calls on *different* agents run in parallel). Agents idle for more than 10 owning-session turns are disposed by a recency sweep (never while streaming); everything is disposed at session shutdown.
 
 ## Limitations
 
@@ -92,7 +93,7 @@ Four tools for spawning in-process subagent sessions (pi SDK `createAgentSession
 
 ## Concurrency
 
-There are **no locks** anywhere in this extension. Safety comes from the fork topology and pi's loop structure:
+The overlay engine has **no locks**: safety comes from the fork topology and pi's loop structure. (The subagent layer has one deliberate exception: a per-agent run chain serializing same-agent runs — see Lifecycle above.)
 
 - Every mutating call writes only to its **private fork**, so concurrent calls can't interleave destructively or see half-staged state.
 - A failed/aborted call's fork is simply never registered — that is the entire "discard" (the fork *is* the attribution; there is nothing to clean up).
@@ -119,4 +120,4 @@ npm run build       # emit dist/
 
 Layout: `extensions/` holds the two thin extension entries; `src/overlay/` is the shared engine (fork topology, bash/python execution, finisher, path mapping); `src/subagent/` is the subagent extension's implementation.
 
-Load with `pi -e /path/to/pi-overlayfs` (both extensions).
+Load with `pi -e /path/to/pi-overlayfs` (both extensions), or install it as a package in your pi config. Note that `-e` loads are session-ephemeral: delegate children re-discover extensions from the settings and project dirs, so a package install is what lets delegates inherit the overlayfs sandbox themselves.
